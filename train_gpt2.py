@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from functools import partial
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 # --- Hyperparameters ---
 total_batch_size = 524288
@@ -190,33 +191,43 @@ optimizer = optax.chain(optax.clip_by_global_norm(1.0),
                         )
 opt_state = optimizer.init(params)
 
+devices = jax.devices()
+print(f"Available devices: {devices}")
+mesh = Mesh(devices, ('data',))
+print(f"Using mesh: {mesh}")
 import time
-for step in range(max_iters):
-    accume_grad = None
-    total_loss = 0.0
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        train_key, subkey = jax.random.split(train_key)
-        xb, yb = get_batch(train_data, subkey)
-        loss, grad = accume_step(params, xb, yb,key=subkey)
-        total_loss += loss.item()
-        if accume_grad is None:
-            accume_grad = grad
-        else:
-            accume_grad = jax.tree.map(lambda g1, g2: g1 + g2, accume_grad, grad)
-    accume_grad = jax.tree.map(lambda g: g / grad_accum_steps, accume_grad)
-    norm = optax.global_norm(accume_grad)
-    updates, opt_state = optimizer.update(accume_grad, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    loss.block_until_ready()  # Ensure loss is computed before timing
-    t1 = time.time()
-    dt = (t1 - t0) * 1000
-    tokens_per_sec = (batch_size * block_size * grad_accum_steps) / (t1 - t0)
-    print(f"Step {step}: train loss {total_loss / grad_accum_steps}, norm {norm}, in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
-    if step % eval_interval == 0:
-        key, eval_key = jax.random.split(key)
-        val_loss = eval_model(params, eval_key)
-        print(f"Step {step}: train loss {total_loss / grad_accum_steps}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+
+with mesh:
+    params = jax.device_put(params, NamedSharding(mesh, P()))
+    opt_state = jax.device_put(opt_state, NamedSharding(mesh, P()))
+
+    for step in range(max_iters):
+        accume_grad = None
+        total_loss = 0.0
+        t0 = time.time()
+        for micro_step in range(grad_accum_steps):
+            train_key, subkey = jax.random.split(train_key)
+            xb, yb = get_batch(train_data, subkey)
+            xb, yb = jax.device_put((xb, yb), NamedSharding(mesh, P('data', None)))
+            loss, grad = accume_step(params, xb, yb,key=subkey)
+            total_loss += loss.item()
+            if accume_grad is None:
+                accume_grad = grad
+            else:
+                accume_grad = jax.tree.map(lambda g1, g2: g1 + g2, accume_grad, grad)
+        accume_grad = jax.tree.map(lambda g: g / grad_accum_steps, accume_grad)
+        norm = optax.global_norm(accume_grad)
+        updates, opt_state = optimizer.update(accume_grad, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        loss.block_until_ready()  # Ensure loss is computed before timing
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        tokens_per_sec = (batch_size * block_size * grad_accum_steps) / (t1 - t0)
+        print(f"Step {step}: train loss {total_loss / grad_accum_steps}, norm {norm}, in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+        if step % eval_interval == 0:
+            key, eval_key = jax.random.split(key)
+            val_loss = eval_model(params, eval_key)
+            print(f"Step {step}: train loss {total_loss / grad_accum_steps}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 
 
