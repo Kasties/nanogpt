@@ -19,8 +19,11 @@ dtype = jnp.bfloat16
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 1000
+tril = jnp.tril(jnp.ones((block_size, block_size), dtype=bool))
+
 rng = jax.random.PRNGKey(1337)
 key, subkey = jax.random.split(rng)
+
 import tiktoken
 
 enc = tiktoken.get_encoding("gpt2")
@@ -63,8 +66,6 @@ def init_model_params(key, vocab_size, n_embd):
         'W_out': [jax.random.normal(key, (num_heads * head_size, n_embd),dtype=dtype) * (0.02 / jnp.sqrt(2*n_layer)) for _ in range(n_layer)],
         'W_ffwd': [jax.random.normal(key, (n_embd, 4*n_embd),dtype=dtype) * 0.02 for _ in range(n_layer)],
         'W_ffwd_project': [jax.random.normal(key, (4*n_embd, n_embd),dtype=dtype) * (0.02 / jnp.sqrt(2*n_layer)) for _ in range(n_layer)],
-        'W_project': [jax.random.normal(key, (n_embd, n_embd),dtype=dtype) * 0.02 for _ in range(n_layer)],
-        'W_lm_head': jax.random.normal(key, (n_embd, vocab_size),dtype=dtype) * 0.02,
         'ln1_gamma': [jnp.ones((n_embd,),dtype=dtype) for _ in range(n_layer)],
         'ln1_beta':  [jnp.zeros((n_embd,),dtype=dtype) for _ in range(n_layer)],
         'ln2_gamma': [jnp.ones((n_embd,),dtype=dtype) for _ in range(n_layer)],
@@ -182,13 +183,13 @@ params = init_model_params(subkey, vocab_size, n_embd)
 
 print(f"Training on {device}...")
 key, train_key = jax.random.split(key)
-schedular = optax.warmup_cosine_decay_schedule(init_value=learning_rate, peak_value=max_lr,decay_steps=max_iters,end_value=min_lr, warmup_steps=warmup_steps)
-optimizer = optax.chain(optax.scale_by_adam(b1=0.9, b2=0.95, eps=1e-8),
-                        optax.scale_by_schedule(schedular),
-                        optax.clip_by_global_norm(1.0),
-                        optax.scale(-1.0))
+
+
+schedular = optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=max_lr,decay_steps=max_iters,end_value=min_lr, warmup_steps=warmup_steps)
+optimizer = optax.chain(optax.clip_by_global_norm(1.0),
+                        optax.adamw(schedular, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1, mask= lambda p: jax.tree.map(lambda x: x.ndim >= 2, p)),
+                        )
 opt_state = optimizer.init(params)
-tril = jnp.tril(jnp.ones((block_size, block_size), dtype=bool))
 
 import time
 for step in range(max_iters):
