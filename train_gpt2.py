@@ -38,10 +38,8 @@ n = int(0.9*len(data_arr))
 train_data = data_arr[:n]
 val_data = data_arr[n:]
 
-
-@partial(jax.jit, static_argnames=['split'])
-def get_batch(split, key):
-    data_arr = train_data if split == 'train' else val_data
+@jax.jit
+def get_batch(data_arr, key):
     
     # Generate random starting indices
     ix = jax.random.randint(key, (batch_size,), 0, len(data_arr) - block_size - 1)
@@ -60,15 +58,16 @@ def get_batch(split, key):
 def init_model_params(key, vocab_size, n_embd):
     
     head_size = n_embd // num_heads
+    keys = jax.random.split(key, num=10*n_layer + 2) # We need a lot of random keys, so we split the key into many subkeys at once
     params = {
-        'token_embedding': jax.random.normal(key, (vocab_size, n_embd),dtype=dtype) * 0.02,
-        'positional_embedding': jax.random.normal(key, (block_size, n_embd),dtype=dtype) * 0.01,
-        'W_q': [jax.random.normal(key, (num_heads, n_embd, head_size),dtype=dtype, ) * 0.02 for _ in range(n_layer)],
-        'W_k': [jax.random.normal(key, (num_heads, n_embd, head_size),dtype=dtype) * 0.02 for _ in range(n_layer)],
-        'W_v': [jax.random.normal(key, (num_heads, n_embd, head_size),dtype=dtype) * 0.02 for _ in range(n_layer)],
-        'W_out': [jax.random.normal(key, (num_heads * head_size, n_embd),dtype=dtype) * (0.02 / jnp.sqrt(2*n_layer)) for _ in range(n_layer)],
-        'W_ffwd': [jax.random.normal(key, (n_embd, 4*n_embd),dtype=dtype) * 0.02 for _ in range(n_layer)],
-        'W_ffwd_project': [jax.random.normal(key, (4*n_embd, n_embd),dtype=dtype) * (0.02 / jnp.sqrt(2*n_layer)) for _ in range(n_layer)],
+        'token_embedding': jax.random.normal(keys[0], (vocab_size, n_embd),dtype=dtype) * 0.02,
+        'positional_embedding': jax.random.normal(keys[1], (block_size, n_embd),dtype=dtype) * 0.01,
+        'W_q': [jax.random.normal(keys[2+i], (num_heads, n_embd, head_size),dtype=dtype, ) * 0.02 for i in range(n_layer)],
+        'W_k': [jax.random.normal(keys[2+n_layer+i], (num_heads, n_embd, head_size),dtype=dtype) * 0.02 for i in range(n_layer)],
+        'W_v': [jax.random.normal(keys[2+2*n_layer+i], (num_heads, n_embd, head_size),dtype=dtype) * 0.02 for i in range(n_layer)],
+        'W_out': [jax.random.normal(keys[2+3*n_layer+i], (num_heads * head_size, n_embd),dtype=dtype) * (0.02 / jnp.sqrt(2*n_layer)) for i in range(n_layer)],
+        'W_ffwd': [jax.random.normal(keys[2+4*n_layer+i], (n_embd, 4*n_embd),dtype=dtype) * 0.02 for i in range(n_layer)],
+        'W_ffwd_project': [jax.random.normal(keys[2+5*n_layer+i], (4*n_embd, n_embd),dtype=dtype) * (0.02 / jnp.sqrt(2*n_layer)) for i in range(n_layer)],
         'ln1_gamma': [jnp.ones((n_embd,),dtype=dtype) for _ in range(n_layer)],
         'ln1_beta':  [jnp.zeros((n_embd,),dtype=dtype) for _ in range(n_layer)],
         'ln2_gamma': [jnp.ones((n_embd,),dtype=dtype) for _ in range(n_layer)],
@@ -143,7 +142,7 @@ def generate(params, prompt_tokens, max_new_tokens=100, temperature=1.0, top_k=N
     for _ in range(max_new_tokens):
         # Crop to block_size if too long
         idx_cond = idx[:, -block_size:]
-        logits = forward(params, idx_cond, is_training=False)
+        logits = forward(params, idx_cond, is_training=False, key=key)  # (1, T, vocab_size)
         logits = logits[:, -1, :]  # (1, vocab_size)
         logits = logits / temperature
         # Optional top-k sampling
@@ -161,8 +160,8 @@ def generate(params, prompt_tokens, max_new_tokens=100, temperature=1.0, top_k=N
     return idx[0]  # return 1D array of tokens
 
 @jax.jit
-def loss_fn(params, idx, targets):
-    logits = forward(params, idx, is_training=True) # (B, T, vocab_size)
+def loss_fn(params, idx, targets, key=None):
+    logits = forward(params, idx, is_training=True, key=key) # (B, T, vocab_size)
     B, T, C = logits.shape
     logits = logits.reshape(B*T, C)
     targets = targets.reshape(B*T)
@@ -170,13 +169,13 @@ def loss_fn(params, idx, targets):
     return loss
 
 @jax.jit
-def accume_step(params, idx, targets):
-    loss, grad = jax.value_and_grad(loss_fn)(params, idx, targets)
+def accume_step(params, idx, targets, key=None):
+    loss, grad = jax.value_and_grad(loss_fn)(params, idx, targets, key=key)
     return loss, grad
 
 def eval_model(params, key):
-    xb, yb = get_batch('val', key)
-    val_loss = loss_fn(params, xb, yb)
+    xb, yb = get_batch(val_data, key)
+    val_loss = loss_fn(params, xb, yb, key=key)
     return val_loss
 # --- Training Loop ---
 params = init_model_params(subkey, vocab_size, n_embd)
@@ -198,14 +197,14 @@ for step in range(max_iters):
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         train_key, subkey = jax.random.split(train_key)
-        xb, yb = get_batch('train', subkey)
-        loss, grad = accume_step(params, xb, yb)
+        xb, yb = get_batch(train_data, subkey)
+        loss, grad = accume_step(params, xb, yb,key=subkey)
         total_loss += loss.item()
         if accume_grad is None:
             accume_grad = grad
         else:
             accume_grad = jax.tree.map(lambda g1, g2: g1 + g2, accume_grad, grad)
-    accume_grad = jax.jax.tree.map(lambda g: g / grad_accum_steps, accume_grad)
+    accume_grad = jax.tree.map(lambda g: g / grad_accum_steps, accume_grad)
     norm = optax.global_norm(accume_grad)
     updates, opt_state = optimizer.update(accume_grad, opt_state, params)
     params = optax.apply_updates(params, updates)
