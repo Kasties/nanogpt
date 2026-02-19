@@ -16,8 +16,9 @@ n_layer = 12
 dropout = 0.2
 num_heads = 12
 dtype = jnp.bfloat16
-
-
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 1000
 rng = jax.random.PRNGKey(1337)
 key, subkey = jax.random.split(rng)
 import tiktoken
@@ -167,9 +168,10 @@ def loss_fn(params, idx, targets):
 @jax.jit
 def training_step(params, opt_state, idx, targets):
     loss, grad = jax.value_and_grad(loss_fn)(params, idx, targets)
+    norm = optax.global_norm(grad)
     updates, opt_state = optimizer.update(grad, opt_state, params)
     params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
+    return params, opt_state, loss ,norm
 
 def eval_model(params, key):
     xb, yb = get_batch('val', key)
@@ -180,7 +182,11 @@ params = init_model_params(subkey, vocab_size, n_embd)
 
 print(f"Training on {device}...")
 key, train_key = jax.random.split(key)
-optimizer = optax.adamw(learning_rate)
+schedular = optax.warmup_cosine_decay_schedule(init_value=learning_rate, peak_value=max_lr,decay_steps=max_iters,end_value=min_lr, warmup_steps=warmup_steps)
+optimizer = optax.chain(optax.scale_by_adam(b1=0.9, b2=0.95, eps=1e-8),
+                        optax.scale_by_schedule(schedular),
+                        optax.clip_by_global_norm(1.0),
+                        optax.scale(-1.0))
 opt_state = optimizer.init(params)
 tril = jnp.tril(jnp.ones((block_size, block_size), dtype=bool))
 
@@ -189,12 +195,12 @@ for step in range(max_iters):
     train_key, subkey = jax.random.split(train_key)
     xb, yb = get_batch('train', subkey)
     t0 = time.time()
-    params, opt_state, loss = training_step(params, opt_state, xb, yb)
+    params, opt_state, loss, norm = training_step(params, opt_state, xb, yb)
     loss.block_until_ready()  # Ensure loss is computed before timing
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tokens_per_sec = (batch_size * block_size) / (t1 - t0)
-    print(f"Step {step}: train loss {loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+    print(f"Step {step}: train loss {loss}, norm {norm} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
     if step % eval_interval == 0:
         key, eval_key = jax.random.split(key)
         val_loss = eval_model(params, eval_key)
