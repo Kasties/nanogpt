@@ -3,10 +3,11 @@ import jax.numpy as jnp
 import optax
 from functools import partial
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-
+import numpy as np
+import os
 # --- Hyperparameters ---
 total_batch_size = 524288
-batch_size = 16
+batch_size = 64
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size*block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
@@ -23,7 +24,7 @@ dtype = jnp.bfloat16
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 1000
-tril = jnp.tril(jnp.ones((block_size, block_size), dtype=bool))
+# tril = jnp.tril(jnp.ones((block_size, block_size), dtype=bool))
 
 rng = jax.random.PRNGKey(1337)
 key, subkey = jax.random.split(rng)
@@ -31,14 +32,10 @@ key, subkey = jax.random.split(rng)
 import tiktoken
 
 enc = tiktoken.get_encoding("gpt2")
-with open("input.txt", "r") as f:
-    data = f.read()
-tokens = enc.encode(data)
-data_arr = jnp.array(tokens, dtype=jnp.int32)
-n = int(0.9*len(data_arr))
-train_data = data_arr[:n]
-val_data = data_arr[n:]
-
+def load_chunk(chunk_idx):
+    tokens = np.fromfile(f"fineweb10B/fineweb_train_{chunk_idx:06d}.bin", dtype=np.uint16)
+    return jnp.array(tokens.astype(np.int32))
+val_data = jnp.array(np.fromfile("fineweb10B/fineweb_val_000000.bin", dtype=np.uint16).astype(np.int32))
 @jax.jit
 def get_batch(data_arr, key):
     
@@ -102,15 +99,15 @@ def forward(params, idx, is_training=False, target=None, key=None):
             k = jnp.einsum('bte,hes->bths', x, params['W_k'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             v = jnp.einsum('bte,hes->bths', x, params['W_v'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             
-            wei = jnp.einsum('bths,buhs->bhtu', q, k) * (head_size ** -0.5) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
-            wei = jnp.where(tril[:T, :T], wei, -jnp.inf)
-            wei = jax.nn.softmax(wei, axis=-1)
-            # wei = apply_dropout(wei, key=key, is_training=is_training)
-            out = jnp.einsum('bhtu,buhs->bths', wei, v) # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
+            # wei = jnp.einsum('bths,buhs->bhtu', q, k) * (head_size ** -0.5) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
+            # wei = jnp.where(tril[:T, :T], wei, -jnp.inf)
+            # wei = jax.nn.softmax(wei, axis=-1)
+            # # wei = apply_dropout(wei, key=key, is_training=is_training)
+            # out = jnp.einsum('bhtu,buhs->bths', wei, v) # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
 
             # More efficient implementation using dot_product_attention
             #NOTE why is this 20 ms slower?
-            # out = jax.nn.dot_product_attention(q, k, v,is_causal=True).reshape(B, T, -1) # (B, T, head_size)
+            out = jax.nn.dot_product_attention(q, k, v,is_causal=True).reshape(B, T, -1) # (B, T, head_size)
             out = out.reshape(B, T, -1) # (B, T, num_heads * head_size)
             out = out @ params['W_out'][layer_idx] # (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
             out = apply_dropout(out, key=key, is_training=is_training)
@@ -196,18 +193,22 @@ print(f"Available devices: {devices}")
 mesh = Mesh(devices, ('data',))
 print(f"Using mesh: {mesh}")
 import time
-
+num_chunks = 103  # full fineweb10B. Each chunk is 100M tokens
+steps_per_chunk = (100_000_000) // (batch_size * block_size * grad_accum_steps)
 with mesh:
     params = jax.device_put(params, NamedSharding(mesh, P()))
     opt_state = jax.device_put(opt_state, NamedSharding(mesh, P()))
-
+    chunck = load_chunk(1) 
     for step in range(max_iters):
+        if step % steps_per_chunk == 0:
+            chunk_idx = (step // steps_per_chunk) % num_chunks + 1
+            current_chunck = load_chunk(chunk_idx)
         accume_grad = None
         total_loss = 0.0
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
             train_key, subkey = jax.random.split(train_key)
-            xb, yb = get_batch(train_data, subkey)
+            xb, yb = get_batch(current_chunck, subkey)
             xb, yb = jax.device_put((xb, yb), NamedSharding(mesh, P('data', None)))
             loss, grad = accume_step(params, xb, yb,key=subkey)
             total_loss += loss.item()
@@ -230,8 +231,19 @@ with mesh:
             print(f"Step {step}: train loss {total_loss / grad_accum_steps}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 
+# write params to disk
+import pickle
+import numpy as np
 
+print("Saving model parameters...")
+# 1. Move parameters to CPU
+# 2. Convert to standard numpy float32 (NumPy doesn't natively support bfloat16)
+params_cpu = jax.tree.map(lambda x: np.array(x, dtype=np.float32), params)
 
+with open("gpt2_params.pkl", "wb") as f:
+    pickle.dump(params_cpu, f)
+    
+print("Model saved successfully as gpt2_params.pkl!")
 # # Generate
 # output_tokens = generate(
 #     params,

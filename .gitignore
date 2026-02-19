@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+./fineweb10B/
+fineweb10B/
