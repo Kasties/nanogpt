@@ -97,14 +97,14 @@ def forward(params, idx, is_training=False, target=None, key=None):
             k = jnp.einsum('bte,hes->bths', x, params['W_k'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             v = jnp.einsum('bte,hes->bths', x, params['W_v'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             
-            wei = jnp.einsum('bths,buhs->bhtu', q, k) * (head_size ** -0.5) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
-            wei = jnp.where(tril[:T, :T], wei, -jnp.inf)
-            wei = jax.nn.softmax(wei, axis=-1)
-            wei = apply_dropout(wei, key=key, is_training=is_training)
-
-            out = jnp.einsum('bhtu,buhs->bths', wei, v) # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
-            out = out.reshape(B, T, -1) # (B, T, num_heads * head_size)
-            out = out @ params['W_out'][layer_idx] # (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
+            # wei = jnp.einsum('bths,buhs->bhtu', q, k) * (head_size ** -0.5) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
+            # wei = jnp.where(tril[:T, :T], wei, -jnp.inf)
+            # wei = jax.nn.softmax(wei, axis=-1)
+            # out = jnp.einsum('bhtu,buhs->bths', wei, v) # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
+            # More efficient implementation using dot_product_attention
+            #NOTE why is this 20 ms slower?
+            attn_weights = jax.nn.dot_product_attention(q, k, v,is_causal=True).reshape(B, T, -1) # (B, T, head_size)
+            out = attn_weights @ params['W_out'][layer_idx] # (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
             out = apply_dropout(out, key=key, is_training=is_training)
             return out
     def transformer_block(x, layer_idx, key=None, is_training=False):
