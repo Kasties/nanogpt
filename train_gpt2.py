@@ -4,8 +4,11 @@ import optax
 from functools import partial
 
 # --- Hyperparameters ---
+total_batch_size = 524288
 batch_size = 16
 block_size = 1024
+grad_accum_steps = total_batch_size // (batch_size*block_size)
+print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
 max_iters = 10000
 learning_rate = 3e-4
 device = 'tpu' 
@@ -167,12 +170,9 @@ def loss_fn(params, idx, targets):
     return loss
 
 @jax.jit
-def training_step(params, opt_state, idx, targets):
+def accume_step(params, idx, targets):
     loss, grad = jax.value_and_grad(loss_fn)(params, idx, targets)
-    norm = optax.global_norm(grad)
-    updates, opt_state = optimizer.update(grad, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss ,norm
+    return loss, grad
 
 def eval_model(params, key):
     xb, yb = get_batch('val', key)
@@ -193,19 +193,31 @@ opt_state = optimizer.init(params)
 
 import time
 for step in range(max_iters):
-    train_key, subkey = jax.random.split(train_key)
-    xb, yb = get_batch('train', subkey)
+    accume_grad = None
+    total_loss = 0.0
     t0 = time.time()
-    params, opt_state, loss, norm = training_step(params, opt_state, xb, yb)
+    for micro_step in range(grad_accum_steps):
+        train_key, subkey = jax.random.split(train_key)
+        xb, yb = get_batch('train', subkey)
+        loss, grad = accume_step(params, xb, yb)
+        total_loss += loss.item()
+        if accume_grad is None:
+            accume_grad = grad
+        else:
+            accume_grad = jax.tree.map(lambda g1, g2: g1 + g2, accume_grad, grad)
+    accume_grad = jax.jax.tree.map(lambda g: g / grad_accum_steps, accume_grad)
+    norm = optax.global_norm(accume_grad)
+    updates, opt_state = optimizer.update(accume_grad, opt_state, params)
+    params = optax.apply_updates(params, updates)
     loss.block_until_ready()  # Ensure loss is computed before timing
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (batch_size * block_size) / (t1 - t0)
-    print(f"Step {step}: train loss {loss}, norm {norm} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+    tokens_per_sec = (batch_size * block_size * grad_accum_steps) / (t1 - t0)
+    print(f"Step {step}: train loss {total_loss / grad_accum_steps}, norm {norm}, in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
     if step % eval_interval == 0:
         key, eval_key = jax.random.split(key)
         val_loss = eval_model(params, eval_key)
-        print(f"Step {step}: train loss {loss}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+        print(f"Step {step}: train loss {total_loss / grad_accum_steps}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 
 
