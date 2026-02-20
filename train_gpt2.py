@@ -6,6 +6,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import os
 import wandb
+import pickle
+import numpy as np
 # --- Hyperparameters ---
 total_batch_size = 524288
 batch_size = 64 * 4
@@ -256,9 +258,7 @@ with mesh:
             print(f"Checkpoint saved!")
 
 
-# write params to disk
-import pickle
-import numpy as np
+
 
 print("Saving model parameters...")
 # 1. Move parameters to CPU

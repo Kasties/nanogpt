@@ -1,0 +1,45 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            ptp4mcmcm8jbsbl4cry7oy7p55h3nxa4:
+                codePath: train_gpt2.py
+                codePathLocal: train_gpt2.py
+                cpu_count: 180
+                cpu_count_logical: 180
+                disk:
+                    /:
+                        total: "103865303040"
+                        used: "32646934528"
+                email: kamsties10@gmail.com
+                executable: /usr/bin/python
+                git:
+                    commit: c75f81a3e0c7535293e2e8d35253f9c710dd4001
+                    remote: https://github.com/Kasties/nanogpt.git
+                host: t1v-n-2c12d688-w-0
+                memory:
+                    total: "1521841627136"
+                os: Linux-6.8.0-1015-gcp-x86_64-with-glibc2.35
+                program: /home/markus/nanogpt/train_gpt2.py
+                python: CPython 3.10.12
+                root: /home/markus/nanogpt
+                startedAt: "2026-02-20T14:56:24.109214Z"
+                tpu:
+                    count: 8
+                    devicesPerChip: 1
+                    hbmGib: 32
+                    name: v6e
+                writerId: ptp4mcmcm8jbsbl4cry7oy7p55h3nxa4
+        m: []
+        python_version: 3.10.12
+        t:
+            "1":
+                - 12
+            "2":
+                - 12
+            "3":
+                - 61
+            "4": 3.10.12
+            "5": 0.25.0
+            "12": 0.25.0
+            "13": linux-x86_64
