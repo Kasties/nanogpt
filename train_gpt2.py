@@ -5,9 +5,10 @@ from functools import partial
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import os
+import wandb
 # --- Hyperparameters ---
 total_batch_size = 524288
-batch_size = 64
+batch_size = 64 * 4
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size*block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
@@ -24,14 +25,13 @@ dtype = jnp.bfloat16
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 1000
+eval_batch_size = 16
 # tril = jnp.tril(jnp.ones((block_size, block_size), dtype=bool))
+wandb.init(project="nanogpt-jax")
 
 rng = jax.random.PRNGKey(1337)
 key, subkey = jax.random.split(rng)
 
-import tiktoken
-
-enc = tiktoken.get_encoding("gpt2")
 def load_chunk(chunk_idx):
     tokens = np.fromfile(f"fineweb10B/fineweb_train_{chunk_idx:06d}.bin", dtype=np.uint16)
     return jnp.array(tokens.astype(np.int32))
@@ -51,7 +51,15 @@ def get_batch(data_arr, key):
     # Vectorize this over the batch of indices
     x, y = jax.vmap(get_slice)(ix)
     return x, y
-
+@jax.jit
+def get_eval_batch(data_arr, key):
+    ix = jax.random.randint(key, (eval_batch_size,), 0, len(data_arr) - block_size - 1)
+    def get_slice(start_i):
+        x = jax.lax.dynamic_slice(data_arr, (start_i,), (block_size,))
+        y = jax.lax.dynamic_slice(data_arr, (start_i + 1,), (block_size,))
+        return x, y
+    x, y = jax.vmap(get_slice)(ix)
+    return x, y
 
 def init_model_params(key, vocab_size, n_embd):
     
@@ -78,9 +86,10 @@ def init_model_params(key, vocab_size, n_embd):
 @partial(jax.jit, static_argnames=['is_training'])
 def forward(params, idx, is_training=False, target=None, key=None):
     def layer_norm(x,gamma,beta,eps=1e-5):
+        x = x.astype(jnp.float32) 
         mean = x.mean(axis=-1, keepdims=True)
         var = x.var(axis=-1, keepdims=True)
-        return gamma * (x - mean) / jnp.sqrt(var + eps) + beta
+        return (gamma * (x - mean) / jnp.sqrt(var + eps) + beta).astype(dtype)
     def apply_dropout(x, rate=dropout, key=None, is_training=False):
         if not is_training or key is None:
             return x
@@ -88,7 +97,8 @@ def forward(params, idx, is_training=False, target=None, key=None):
         return x * keep / (1.0 - rate)
 
     def feedforward(x, layer_idx):
-        out = jax.nn.gelu(x @ params['W_ffwd'][layer_idx],approximate=True) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use aproximate gelu as it was the original activation in GPT2
+        out = x @ params['W_ffwd'][layer_idx].astype(jnp.float32) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd)
+        out = jax.nn.gelu(out,approximate=True).astype(dtype) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use aproximate gelu as it was the original activation in GPT2
         out = out @ params['W_ffwd_project'][layer_idx] # (B, T, 4*n_embd) @ (4*n_embd, n_embd) -> (B, T, n_embd)
         # out = apply_dropout(out, key=jax.random.PRNGKey(42), is_training=is_training) # No dropout for simplicity
         return out
@@ -125,7 +135,7 @@ def forward(params, idx, is_training=False, target=None, key=None):
     for i in range(n_layer): # Just one block for simplicity
         x = transformer_block(x, layer_idx=i, key=key, is_training=is_training)
     x = layer_norm(x, params['ln_f_gamma'], params['ln_f_beta']) # (B, T, n_embd)
-    x = x @ params['token_embedding'].T # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
+    x = x.astype(jnp.float32) @ params['token_embedding'].T.astype(jnp.float32) # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
 
     return x # (B, T, vocab_size) 
 
@@ -163,7 +173,7 @@ def loss_fn(params, idx, targets, key=None):
     B, T, C = logits.shape
     logits = logits.reshape(B*T, C)
     targets = targets.reshape(B*T)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets).mean()
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), targets).mean()
     return loss
 
 @jax.jit
@@ -172,7 +182,7 @@ def accume_step(params, idx, targets, key=None):
     return loss, grad
 
 def eval_model(params, key):
-    xb, yb = get_batch(val_data, key)
+    xb, yb = get_eval_batch(val_data, key)
     val_loss = loss_fn(params, xb, yb, key=key)
     return val_loss
 # --- Training Loop ---
@@ -198,7 +208,6 @@ steps_per_chunk = (100_000_000) // (batch_size * block_size * grad_accum_steps)
 with mesh:
     params = jax.device_put(params, NamedSharding(mesh, P()))
     opt_state = jax.device_put(opt_state, NamedSharding(mesh, P()))
-    chunck = load_chunk(1) 
     for step in range(max_iters):
         if step % steps_per_chunk == 0:
             chunk_idx = (step // steps_per_chunk) % num_chunks + 1
@@ -211,11 +220,12 @@ with mesh:
             xb, yb = get_batch(current_chunck, subkey)
             xb, yb = jax.device_put((xb, yb), NamedSharding(mesh, P('data', None)))
             loss, grad = accume_step(params, xb, yb,key=subkey)
-            total_loss += loss.item()
+            total_loss += loss
             if accume_grad is None:
                 accume_grad = grad
             else:
                 accume_grad = jax.tree.map(lambda g1, g2: g1 + g2, accume_grad, grad)
+        avg_loss = float(total_loss) / grad_accum_steps
         accume_grad = jax.tree.map(lambda g: g / grad_accum_steps, accume_grad)
         norm = optax.global_norm(accume_grad)
         updates, opt_state = optimizer.update(accume_grad, opt_state, params)
@@ -224,11 +234,26 @@ with mesh:
         t1 = time.time()
         dt = (t1 - t0) * 1000
         tokens_per_sec = (batch_size * block_size * grad_accum_steps) / (t1 - t0)
-        print(f"Step {step}: train loss {total_loss / grad_accum_steps}, norm {norm}, in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+        wandb.log({
+                "train/loss": avg_loss,
+                "train/grad_norm": float(norm),
+                "train/tokens_per_sec": tokens_per_sec,
+                "train/lr": float(schedular(step)),
+            }, step=step)
         if step % eval_interval == 0:
             key, eval_key = jax.random.split(key)
             val_loss = eval_model(params, eval_key)
-            print(f"Step {step}: train loss {total_loss / grad_accum_steps}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+            wandb.log({"val/loss": float(val_loss)}, step=step)
+        if step % 1000 == 0 and step > 0:
+            print(f"Saving checkpoint at step {step}...")
+            checkpoint = {
+                'step': step,
+                'params': jax.tree.map(lambda x: np.array(x, dtype=np.float32), params),
+                'opt_state': jax.tree.map(lambda x: np.array(x, dtype=np.float32) if hasattr(x, 'dtype') else x, opt_state),
+            }
+            with open(f"checkpoint_step_{step}.pkl", "wb") as f:
+                pickle.dump(checkpoint, f)
+            print(f"Checkpoint saved!")
 
 
 # write params to disk
