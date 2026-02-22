@@ -25,7 +25,7 @@ vocab_size = 50304
 eval_interval = 300
 n_embd = 768
 n_layer = 12
-dropout = 0.2
+dropout = 0.0
 num_heads = 12
 param_dtype = jnp.float32
 compute_dtype = jnp.bfloat16
@@ -105,7 +105,7 @@ def forward(params, idx, is_training=False, target=None, key=None):
         var = x.var(axis=-1, keepdims=True)
         return gamma.astype(jnp.float32) * (x - mean) / jnp.sqrt(var + eps) + beta.astype(jnp.float32)
     def apply_dropout(x, rate=dropout, key=None, is_training=False):
-        if not is_training or key is None:
+        if rate == 0.0 or not is_training or key is None:
             return x
         keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
         return x * keep / (1.0 - rate)
