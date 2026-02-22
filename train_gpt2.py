@@ -121,9 +121,9 @@ def forward(params, idx, is_training=False, target=None, key=None):
     def multi_head_attention(x, layer_idx, key=None, is_training=False):
             x_bf16 = x.astype(compute_dtype)
             # (B, T, n_embd) -> (B, T, num_heads * head_size)
-            q = jnp.einsum('bte,hes->bths', x_bf16, params['W_q'][layer_idx].astype(compute_dtype)).astype(jnp.float32) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            k = jnp.einsum('bte,hes->bths', x_bf16, params['W_k'][layer_idx].astype(compute_dtype)).astype(jnp.float32) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            v = jnp.einsum('bte,hes->bths', x_bf16, params['W_v'][layer_idx].astype(compute_dtype)).astype(jnp.float32) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            q = jnp.einsum('bte,hes->bths', x_bf16, params['W_q'][layer_idx].astype(compute_dtype)).astype(compute_dtype) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            k = jnp.einsum('bte,hes->bths', x_bf16, params['W_k'][layer_idx].astype(compute_dtype)).astype(compute_dtype) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            v = jnp.einsum('bte,hes->bths', x_bf16, params['W_v'][layer_idx].astype(compute_dtype)).astype(compute_dtype) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             
             # wei = jnp.einsum('bths,buhs->bhtu', q, k) * (head_size ** -0.5) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
             # wei = jnp.where(tril[:T, :T], wei, -jnp.inf)
