@@ -1,0 +1,34 @@
+{
+  "os":  "Linux-6.8.0-1015-gcp-x86_64-with-glibc2.35",
+  "python":  "CPython 3.10.12",
+  "startedAt":  "2026-02-20T12:56:19.649323Z",
+  "program":  "/home/markus/nanogpt/train_gpt2.py",
+  "codePath":  "train_gpt2.py",
+  "codePathLocal":  "train_gpt2.py",
+  "git":  {
+    "remote":  "https://github.com/Kasties/nanogpt.git",
+    "commit":  "44a8fe25bec2b3a5f26e5a5b529d37a4555a7d90"
+  },
+  "email":  "kamsties10@gmail.com",
+  "root":  "/home/markus/nanogpt",
+  "host":  "t1v-n-2c12d688-w-0",
+  "executable":  "/usr/bin/python",
+  "cpu_count":  180,
+  "cpu_count_logical":  180,
+  "disk":  {
+    "/":  {
+      "total":  "103865303040",
+      "used":  "32014852096"
+    }
+  },
+  "memory":  {
+    "total":  "1521841627136"
+  },
+  "tpu":  {
+    "name":  "v6e",
+    "hbmGib":  32,
+    "devicesPerChip":  1,
+    "count":  8
+  },
+  "writerId":  "4en0ln6ajd274jer2q0svzl1gcm5kzue"
+}

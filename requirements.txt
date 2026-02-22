@@ -3,3 +3,4 @@ optax
 numpy
 tiktoken
 huggingface_hub
+wandb
