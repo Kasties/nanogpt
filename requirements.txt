@@ -1,4 +1,5 @@
-jax
+-f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+jax[tpu]
 optax
 numpy
 tiktoken

@@ -75,20 +75,20 @@ def init_model_params(key, vocab_size, n_embd):
     head_size = n_embd // num_heads
     keys = jax.random.split(key, num=10*n_layer + 2) # We need a lot of random keys, so we split the key into many subkeys at once
     params = {
-        'token_embedding': jax.random.normal(keys[0], (vocab_size, n_embd),dtype=dtype) * 0.02,
-        'positional_embedding': jax.random.normal(keys[1], (block_size, n_embd),dtype=dtype) * 0.01,
-        'W_q': [jax.random.normal(keys[2+i], (num_heads, n_embd, head_size),dtype=dtype, ) * 0.02 for i in range(n_layer)],
-        'W_k': [jax.random.normal(keys[2+n_layer+i], (num_heads, n_embd, head_size),dtype=dtype) * 0.02 for i in range(n_layer)],
-        'W_v': [jax.random.normal(keys[2+2*n_layer+i], (num_heads, n_embd, head_size),dtype=dtype) * 0.02 for i in range(n_layer)],
-        'W_out': [jax.random.normal(keys[2+3*n_layer+i], (num_heads * head_size, n_embd),dtype=dtype) * (0.02 / jnp.sqrt(2*n_layer)) for i in range(n_layer)],
-        'W_ffwd': [jax.random.normal(keys[2+4*n_layer+i], (n_embd, 4*n_embd),dtype=dtype) * 0.02 for i in range(n_layer)],
-        'W_ffwd_project': [jax.random.normal(keys[2+5*n_layer+i], (4*n_embd, n_embd),dtype=dtype) * (0.02 / jnp.sqrt(2*n_layer)) for i in range(n_layer)],
-        'ln1_gamma': [jnp.ones((n_embd,),dtype=dtype) for _ in range(n_layer)],
-        'ln1_beta':  [jnp.zeros((n_embd,),dtype=dtype) for _ in range(n_layer)],
-        'ln2_gamma': [jnp.ones((n_embd,),dtype=dtype) for _ in range(n_layer)],
-        'ln2_beta':  [jnp.zeros((n_embd,),dtype=dtype) for _ in range(n_layer)],
-        'ln_f_gamma': jnp.ones((n_embd,),dtype=dtype),
-        'ln_f_beta':  jnp.zeros((n_embd,),dtype=dtype),
+        'token_embedding': jax.random.normal(keys[0], (vocab_size, n_embd)) * 0.02,
+        'positional_embedding': jax.random.normal(keys[1], (block_size, n_embd)) * 0.01,
+        'W_q': [jax.random.normal(keys[2+i], (num_heads, n_embd, head_size)) * 0.02 for i in range(n_layer)],
+        'W_k': [jax.random.normal(keys[2+n_layer+i], (num_heads, n_embd, head_size)) * 0.02 for i in range(n_layer)],
+        'W_v': [jax.random.normal(keys[2+2*n_layer+i], (num_heads, n_embd, head_size)) * 0.02 for i in range(n_layer)],
+        'W_out': [jax.random.normal(keys[2+3*n_layer+i], (num_heads * head_size, n_embd)) * (0.02 / jnp.sqrt(2*n_layer)) for i in range(n_layer)],
+        'W_ffwd': [jax.random.normal(keys[2+4*n_layer+i], (n_embd, 4*n_embd)) * 0.02 for i in range(n_layer)],
+        'W_ffwd_project': [jax.random.normal(keys[2+5*n_layer+i], (4*n_embd, n_embd)) * (0.02 / jnp.sqrt(2*n_layer)) for i in range(n_layer)],
+        'ln1_gamma': [jnp.ones((n_embd,)) for _ in range(n_layer)],
+        'ln1_beta':  [jnp.zeros((n_embd,)) for _ in range(n_layer)],
+        'ln2_gamma': [jnp.ones((n_embd,)) for _ in range(n_layer)],
+        'ln2_beta':  [jnp.zeros((n_embd,)) for _ in range(n_layer)],
+        'ln_f_gamma': jnp.ones((n_embd,)),
+        'ln_f_beta':  jnp.zeros((n_embd,)),
     }
     return params
 
@@ -107,10 +107,10 @@ def forward(params, idx, is_training=False, target=None, key=None):
 
     def feedforward(x, layer_idx):
         out = x @ params['W_ffwd'][layer_idx].astype(jnp.float32) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd)
-        out = jax.nn.gelu(out,approximate=True).astype(dtype) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use aproximate gelu as it was the original activation in GPT2
+        out = jax.nn.gelu(out,approximate=True).astype(jnp.float32) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use aproximate gelu as it was the original activation in GPT2
         out = out @ params['W_ffwd_project'][layer_idx] # (B, T, 4*n_embd) @ (4*n_embd, n_embd) -> (B, T, n_embd)
         # out = apply_dropout(out, key=jax.random.PRNGKey(42), is_training=is_training) # No dropout for simplicity
-        return out
+        return out.astype(dtype)
 
     def multi_head_attention(x, layer_idx, key=None, is_training=False):
             # (B, T, n_embd) -> (B, T, num_heads * head_size)
@@ -137,7 +137,7 @@ def forward(params, idx, is_training=False, target=None, key=None):
         return x
     B,T = idx.shape
 
-    token_embeddings = jnp.take(params['token_embedding'], idx, axis=0) # (B, T, n_embd)
+    token_embeddings = jnp.take(params['token_embedding'].astype(dtype=dtype), idx, axis=0) # (B, T, n_embd)
     positional_embeddings = params['positional_embedding'][jnp.arange(T)] # (T, n_embd)
     head_size = n_embd // num_heads
     x = token_embeddings + positional_embeddings
