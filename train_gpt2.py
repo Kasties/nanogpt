@@ -14,7 +14,7 @@ import pickle
 import numpy as np
 # --- Hyperparameters ---
 total_batch_size = 524288
-batch_size = 64 * 4
+batch_size = 64 * 2
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size*block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
