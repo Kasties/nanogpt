@@ -5,6 +5,10 @@ from functools import partial
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import os
+import tiktoken
+import time
+import pickle
+import numpy as np
 # --- Hyperparameters ---
 total_batch_size = 524288
 batch_size = 64
@@ -29,7 +33,7 @@ warmup_steps = 1000
 rng = jax.random.PRNGKey(1337)
 key, subkey = jax.random.split(rng)
 
-import tiktoken
+
 
 enc = tiktoken.get_encoding("gpt2")
 def load_chunk(chunk_idx):
@@ -192,7 +196,7 @@ devices = jax.devices()
 print(f"Available devices: {devices}")
 mesh = Mesh(devices, ('data',))
 print(f"Using mesh: {mesh}")
-import time
+
 num_chunks = 103  # full fineweb10B. Each chunk is 100M tokens
 steps_per_chunk = (100_000_000) // (batch_size * block_size * grad_accum_steps)
 with mesh:
@@ -232,8 +236,7 @@ with mesh:
 
 
 # write params to disk
-import pickle
-import numpy as np
+
 
 print("Saving model parameters...")
 # 1. Move parameters to CPU
