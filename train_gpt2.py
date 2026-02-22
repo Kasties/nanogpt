@@ -99,11 +99,12 @@ def init_model_params(key, vocab_size, n_embd):
 
 @partial(jax.jit, static_argnames=['is_training'])
 def forward(params, idx, is_training=False, target=None, key=None):
+    p = jax.tree.map(lambda x: x.astype(compute_dtype), params)
     def layer_norm(x,gamma,beta,eps=1e-5):
         x = x.astype(jnp.float32) 
         mean = x.mean(axis=-1, keepdims=True)
         var = x.var(axis=-1, keepdims=True)
-        return gamma.astype(jnp.float32) * (x - mean) / jnp.sqrt(var + eps) + beta.astype(jnp.float32)
+        return (gamma.astype(jnp.float32) * (x - mean) / jnp.sqrt(var + eps) + beta.astype(jnp.float32)).astype(compute_dtype)
     def apply_dropout(x, rate=dropout, key=None, is_training=False):
         if rate == 0.0 or not is_training or key is None:
             return x
@@ -111,17 +112,17 @@ def forward(params, idx, is_training=False, target=None, key=None):
         return x * keep / (1.0 - rate)
 
     def feedforward(x, layer_idx):
-        out = x @ params['W_ffwd'][layer_idx]# (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd)
+        out = x @ p['W_ffwd'][layer_idx]# (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd)
         out = jax.nn.gelu(out.astype(jnp.float32),approximate=True).astype(compute_dtype) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use aproximate gelu as it was the original activation in GPT2
-        out = out @ params['W_ffwd_project'][layer_idx] # (B, T, 4*n_embd) @ (4*n_embd, n_embd) -> (B, T, n_embd)
+        out = out @ p['W_ffwd_project'][layer_idx] # (B, T, 4*n_embd) @ (4*n_embd, n_embd) -> (B, T, n_embd)
         # out = apply_dropout(out, key=jax.random.PRNGKey(42), is_training=is_training) # No dropout for simplicity
-        return out.astype(jnp.float32)
+        return out
 
     def multi_head_attention(x, layer_idx, key=None, is_training=False):
             # (B, T, n_embd) -> (B, T, num_heads * head_size)
-            q = jnp.einsum('bte,hes->bths', x, params['W_q'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            k = jnp.einsum('bte,hes->bths', x, params['W_k'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            v = jnp.einsum('bte,hes->bths', x, params['W_v'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            q = jnp.einsum('bte,hes->bths', x, p['W_q'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            k = jnp.einsum('bte,hes->bths', x, p['W_k'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            v = jnp.einsum('bte,hes->bths', x, p['W_v'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             
             # wei = jnp.einsum('bths,buhs->bhtu', q, k) * (head_size ** -0.5) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
             # wei = jnp.where(tril[:T, :T], wei, -jnp.inf)
@@ -133,22 +134,22 @@ def forward(params, idx, is_training=False, target=None, key=None):
             #NOTE why is this 20 ms slower?
             out = jax.nn.dot_product_attention(q, k, v,is_causal=True)
             out = out.astype(compute_dtype).reshape(B, T, -1) # (B, T, head_size)
-            out = out @ params['W_out'][layer_idx]# (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
+            out = out @ p['W_out'][layer_idx]# (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
             out = apply_dropout(out, key=key, is_training=is_training)
             return out
     def transformer_block(x, layer_idx, key=None, is_training=False):
-        x = x + multi_head_attention(layer_norm(x, params['ln1_gamma'][layer_idx], params['ln1_beta'][layer_idx]), layer_idx=layer_idx, key=key,is_training=is_training) # (B,T,n_embd)
-        x = x + feedforward(layer_norm(x, params['ln2_gamma'][layer_idx], params['ln2_beta'][layer_idx]), layer_idx=layer_idx) # (B,T,n_embd)
+        x = x + multi_head_attention(layer_norm(x, p['ln1_gamma'][layer_idx], p['ln1_beta'][layer_idx]), layer_idx=layer_idx, key=key,is_training=is_training) # (B,T,n_embd)
+        x = x + feedforward(layer_norm(x, p['ln2_gamma'][layer_idx], p['ln2_beta'][layer_idx]), layer_idx=layer_idx) # (B,T,n_embd)
         return x
     B,T = idx.shape
 
-    token_embeddings = jnp.take(params['token_embedding'], idx, axis=0).astype(jnp.float32) # (B, T, n_embd)
-    positional_embeddings = params['positional_embedding'][jnp.arange(T)].astype(jnp.float32) # (T, n_embd)
+    token_embeddings = jnp.take(p['token_embedding'], idx, axis=0) # (B, T, n_embd)
+    positional_embeddings = p['positional_embedding'][jnp.arange(T)] # (T, n_embd)
     x = token_embeddings + positional_embeddings
     for i in range(n_layer): # Just one block for simplicity
         x = transformer_block(x, layer_idx=i, key=key, is_training=is_training)
-    x = layer_norm(x, params['ln_f_gamma'], params['ln_f_beta']) # (B, T, n_embd)
-    x = x @ params['token_embedding'].T # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
+    x = layer_norm(x, p['ln_f_gamma'], p['ln_f_beta']) # (B, T, n_embd)
+    x = x.astype(jnp.float32) @ params['token_embedding'].T.astype(jnp.float32) # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
 
     return x.astype(jnp.float32) # (B, T, vocab_size) 
 
