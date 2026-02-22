@@ -27,7 +27,7 @@ n_embd = 768
 n_layer = 12
 dropout = 0.2
 num_heads = 12
-dtype = jnp.bfloat16
+dtype = jnp.float32
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 1000
@@ -114,9 +114,9 @@ def forward(params, idx, is_training=False, target=None, key=None):
 
     def multi_head_attention(x, layer_idx, key=None, is_training=False):
             # (B, T, n_embd) -> (B, T, num_heads * head_size)
-            q = jnp.einsum('bte,hes->bths', x, params['W_q'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            k = jnp.einsum('bte,hes->bths', x, params['W_k'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            v = jnp.einsum('bte,hes->bths', x, params['W_v'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            q = jnp.einsum('bte,hes->bths', x, params['W_q'][layer_idx]).astype(jnp.float32) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            k = jnp.einsum('bte,hes->bths', x, params['W_k'][layer_idx]).astype(jnp.float32) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            v = jnp.einsum('bte,hes->bths', x, params['W_v'][layer_idx]).astype(jnp.float32) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             
             # wei = jnp.einsum('bths,buhs->bhtu', q, k) * (head_size ** -0.5) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
             # wei = jnp.where(tril[:T, :T], wei, -jnp.inf)
@@ -126,11 +126,11 @@ def forward(params, idx, is_training=False, target=None, key=None):
 
             # More efficient implementation using dot_product_attention
             #NOTE why is this 20 ms slower?
-            out = jax.nn.dot_product_attention(q, k, v,is_causal=True).reshape(B, T, -1) # (B, T, head_size)
-            out = out.reshape(B, T, -1) # (B, T, num_heads * head_size)
-            out = out @ params['W_out'][layer_idx] # (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
+            out = jax.nn.dot_product_attention(q, k, v,is_causal=True)
+            out = out.reshape(B, T, -1).astype(jnp.float32) # (B, T, head_size)
+            out = out @ params['W_out'][layer_idx].astype(jnp.float32) # (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
             out = apply_dropout(out, key=key, is_training=is_training)
-            return out
+            return out.astype(dtype)
     def transformer_block(x, layer_idx, key=None, is_training=False):
         x = x + multi_head_attention(layer_norm(x, params['ln1_gamma'][layer_idx], params['ln1_beta'][layer_idx]), layer_idx=layer_idx, key=key,is_training=is_training) # (B,T,n_embd)
         x = x + feedforward(layer_norm(x, params['ln2_gamma'][layer_idx], params['ln2_beta'][layer_idx]), layer_idx=layer_idx) # (B,T,n_embd)
@@ -139,7 +139,6 @@ def forward(params, idx, is_training=False, target=None, key=None):
 
     token_embeddings = jnp.take(params['token_embedding'].astype(dtype=dtype), idx, axis=0) # (B, T, n_embd)
     positional_embeddings = params['positional_embedding'][jnp.arange(T)] # (T, n_embd)
-    head_size = n_embd // num_heads
     x = token_embeddings + positional_embeddings
     for i in range(n_layer): # Just one block for simplicity
         x = transformer_block(x, layer_idx=i, key=key, is_training=is_training)
@@ -205,6 +204,7 @@ schedular = optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=max_lr
 optimizer = optax.chain(optax.clip_by_global_norm(1.0),
                         optax.adamw(schedular, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1, mask= lambda p: jax.tree.map(lambda x: x.ndim >= 2, p)),
                         )
+optimizer = optax.apply_if_finite(optimizer,max_consecutive_errors=5)
 opt_state = optimizer.init(params)
 
 devices = jax.devices()
