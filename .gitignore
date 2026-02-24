@@ -11,3 +11,5 @@ wheels/
 
 ./fineweb10B/
 fineweb10B/
+wandb/
+./wandb/

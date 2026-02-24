@@ -14,7 +14,7 @@ import pickle
 import numpy as np
 # --- Hyperparameters ---
 total_batch_size = 524288
-batch_size = 64 * 2
+batch_size = 64
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size*block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
@@ -72,57 +72,98 @@ def get_eval_batch(data_arr, key):
     return x, y
 
 def init_model_params(key, vocab_size, n_embd):
-    
     head_size = n_embd // num_heads
-    keys = jax.random.split(key, num=10*n_layer + 2) # We need a lot of random keys, so we split the key into many subkeys at once
-
+    keys = jax.random.split(key, num=6 * n_layer + 2)
+    
     def p(x):
         return x.astype(param_dtype)
 
+    # Small helper to grab the next n keys from the pool
+    _offset = [0]
+    def take(n=1):
+        s = slice(_offset[0], _offset[0] + n)
+        _offset[0] += n
+        return keys[s] if n > 1 else keys[s][0]
+
+    res_scale = 0.02 / jnp.sqrt(2 * n_layer)
+
     params = {
-        'token_embedding': p(jax.random.normal(keys[0], (vocab_size, n_embd)) * 0.02),
-        'positional_embedding': p(jax.random.normal(keys[1], (block_size, n_embd)) * 0.01),
-        'W_q': [p(jax.random.normal(keys[2+i], (num_heads, n_embd, head_size)) * 0.02) for i in range(n_layer)],
-        'W_k': [p(jax.random.normal(keys[2+n_layer+i], (num_heads, n_embd, head_size)) * 0.02) for i in range(n_layer)],
-        'W_v': [p(jax.random.normal(keys[2+2*n_layer+i], (num_heads, n_embd, head_size)) * 0.02) for i in range(n_layer)],
-        'W_out': [p(jax.random.normal(keys[2+3*n_layer+i], (num_heads * head_size, n_embd)) * (0.02 / jnp.sqrt(2*n_layer))) for i in range(n_layer)],
-        'W_ffwd': [p(jax.random.normal(keys[2+4*n_layer+i], (n_embd, 4*n_embd)) * 0.02) for i in range(n_layer)],
-        'W_ffwd_project': [p(jax.random.normal(keys[2+5*n_layer+i], (4*n_embd, n_embd)) * (0.02 / jnp.sqrt(2*n_layer))) for i in range(n_layer)],
-        'ln1_gamma': [jnp.ones((n_embd,), dtype=param_dtype) for _ in range(n_layer)],
-        'ln1_beta':  [jnp.zeros((n_embd,), dtype=param_dtype) for _ in range(n_layer)],
-        'ln2_gamma': [jnp.ones((n_embd,), dtype=param_dtype) for _ in range(n_layer)],
-        'ln2_beta':  [jnp.zeros((n_embd,), dtype=param_dtype) for _ in range(n_layer)],
-        'ln_f_gamma': jnp.ones((n_embd,), dtype=param_dtype),
+        'token_embedding':      p(jax.random.normal(take(), (vocab_size, n_embd)) * 0.02),
+        'positional_embedding': p(jax.random.normal(take(), (block_size, n_embd)) * 0.01),
+        'ln_f_gamma': jnp.ones((n_embd,),  dtype=param_dtype),
         'ln_f_beta':  jnp.zeros((n_embd,), dtype=param_dtype),
+        'layers': {
+            'W_q':            p(jax.vmap(lambda k: jax.random.normal(k, (num_heads, n_embd, head_size)) * 0.02)(take(n_layer))),
+            'W_k':            p(jax.vmap(lambda k: jax.random.normal(k, (num_heads, n_embd, head_size)) * 0.02)(take(n_layer))),
+            'W_v':            p(jax.vmap(lambda k: jax.random.normal(k, (num_heads, n_embd, head_size)) * 0.02)(take(n_layer))),
+            'W_out':          p(jax.vmap(lambda k: jax.random.normal(k, (num_heads * head_size, n_embd)) * res_scale)(take(n_layer))),
+            'W_ffwd':         p(jax.vmap(lambda k: jax.random.normal(k, (n_embd, 4 * n_embd)) * 0.02)(take(n_layer))),
+            'W_ffwd_project': p(jax.vmap(lambda k: jax.random.normal(k, (4 * n_embd, n_embd)) * res_scale)(take(n_layer))),
+            'ln1_gamma': jnp.ones( (n_layer, n_embd), dtype=param_dtype),
+            'ln1_beta':  jnp.zeros((n_layer, n_embd), dtype=param_dtype),
+            'ln2_gamma': jnp.ones( (n_layer, n_embd), dtype=param_dtype),
+            'ln2_beta':  jnp.zeros((n_layer, n_embd), dtype=param_dtype),
+        },
     }
     return params
 
+def zeropower_via_newtonschultz5(G,steps=10,eps=1e-7):
+    assert len(G.shape) == 2
+    a,b,c = (3.4445,-4.7750,2.0315)
+    X = G.astype(jnp.bfloat16)
+    X = X / (jnp.linalg.norm(X) + eps)
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+def muon(params,lr=0.02,momentum=0.95,nesterov=True,backend_steps=5):
+
+    for group in jax.tree_leaves(params):
+        lr = group['lr']
+        momentum = group['momentum']
+        total_parmas = sum([p.size for p in jax.tree_leaves(params)])
+        updates_flat = jnp.zeros(total_parmas, dtype=jnp.bfloat16)
+        curr_idx = 0
+        for i,p in enumerate(jax.tree_leaves(params)):
+            param_size = p.size
+            grad_flat = jax.random.normal(jax.random.PRNGKey(i), (param_size,), dtype=jnp.bfloat16) # Placeholder for actual gradients
+            updates_flat = updates_flat.at[curr_idx:curr_idx+param_size].set(grad_flat)
+            curr_idx += param_size
+
 @partial(jax.jit, static_argnames=['is_training'])
 def forward(params, idx, is_training=False, target=None, key=None):
-    p = jax.tree.map(lambda x: x.astype(compute_dtype), params)
+    def scan_fn(x, layer_params):
+        x = transformer_block(x,layer_params, key=key, is_training=is_training)
+        return x, None
     def layer_norm(x,gamma,beta,eps=1e-5):
-        x = x.astype(jnp.float32) 
+        x = x.astype(param_dtype) 
         mean = x.mean(axis=-1, keepdims=True)
         var = x.var(axis=-1, keepdims=True)
-        return (gamma.astype(jnp.float32) * (x - mean) / jnp.sqrt(var + eps) + beta.astype(jnp.float32)).astype(compute_dtype)
+        return (gamma.astype(param_dtype) * (x - mean) / jnp.sqrt(var + eps) + beta.astype(param_dtype)).astype(compute_dtype)
     def apply_dropout(x, rate=dropout, key=None, is_training=False):
         if rate == 0.0 or not is_training or key is None:
             return x
         keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
         return x * keep / (1.0 - rate)
 
-    def feedforward(x, layer_idx):
-        out = x @ p['W_ffwd'][layer_idx]# (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd)
-        out = jax.nn.gelu(out.astype(jnp.float32),approximate=True).astype(compute_dtype) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use aproximate gelu as it was the original activation in GPT2
-        out = out @ p['W_ffwd_project'][layer_idx] # (B, T, 4*n_embd) @ (4*n_embd, n_embd) -> (B, T, n_embd)
+    def feedforward(x, layer_params):
+        out = x @ layer_params['W_ffwd']# (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd)
+        out = jax.nn.gelu(out.astype(param_dtype),approximate=True).astype(compute_dtype) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use aproximate gelu as it was the original activation in GPT2
+        out = out @ layer_params['W_ffwd_project'] # (B, T, 4*n_embd) @ (4*n_embd, n_embd) -> (B, T, n_embd)
         # out = apply_dropout(out, key=jax.random.PRNGKey(42), is_training=is_training) # No dropout for simplicity
         return out
 
-    def multi_head_attention(x, layer_idx, key=None, is_training=False):
+    def multi_head_attention(x, layer_params, key=None, is_training=False):
             # (B, T, n_embd) -> (B, T, num_heads * head_size)
-            q = jnp.einsum('bte,hes->bths', x, p['W_q'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            k = jnp.einsum('bte,hes->bths', x, p['W_k'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            v = jnp.einsum('bte,hes->bths', x, p['W_v'][layer_idx]) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            q = jnp.einsum('bte,hes->bths', x, layer_params['W_q']) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            k = jnp.einsum('bte,hes->bths', x, layer_params['W_k']) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            v = jnp.einsum('bte,hes->bths', x, layer_params['W_v']) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             
             # wei = jnp.einsum('bths,buhs->bhtu', q, k) * (head_size ** -0.5) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
             # wei = jnp.where(tril[:T, :T], wei, -jnp.inf)
@@ -134,24 +175,22 @@ def forward(params, idx, is_training=False, target=None, key=None):
             #NOTE why is this 20 ms slower?
             out = jax.nn.dot_product_attention(q, k, v,is_causal=True)
             out = out.astype(compute_dtype).reshape(B, T, -1) # (B, T, head_size)
-            out = out @ p['W_out'][layer_idx]# (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
+            out = out @ layer_params['W_out']# (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
             out = apply_dropout(out, key=key, is_training=is_training)
             return out
-    def transformer_block(x, layer_idx, key=None, is_training=False):
-        x = x + multi_head_attention(layer_norm(x, p['ln1_gamma'][layer_idx], p['ln1_beta'][layer_idx]), layer_idx=layer_idx, key=key,is_training=is_training) # (B,T,n_embd)
-        x = x + feedforward(layer_norm(x, p['ln2_gamma'][layer_idx], p['ln2_beta'][layer_idx]), layer_idx=layer_idx) # (B,T,n_embd)
+    def transformer_block(x, layer_params, key=None, is_training=False):
+        x = x + multi_head_attention(layer_norm(x, layer_params['ln1_gamma'], layer_params['ln1_beta']), layer_params, key=key,is_training=is_training) # (B,T,n_embd)
+        x = x + feedforward(layer_norm(x, layer_params['ln2_gamma'], layer_params['ln2_beta']), layer_params) # (B,T,n_embd)
         return x
     B,T = idx.shape
 
-    token_embeddings = jnp.take(p['token_embedding'], idx, axis=0) # (B, T, n_embd)
-    positional_embeddings = p['positional_embedding'][jnp.arange(T)] # (T, n_embd)
-    x = token_embeddings + positional_embeddings
-    for i in range(n_layer): # Just one block for simplicity
-        x = transformer_block(x, layer_idx=i, key=key, is_training=is_training)
-    x = layer_norm(x, p['ln_f_gamma'], p['ln_f_beta']) # (B, T, n_embd)
-    x = x.astype(jnp.float32) @ params['token_embedding'].T.astype(jnp.float32) # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
+    x = params['token_embedding'][idx] # (B, T, n_embd)
+    x = x + params['positional_embedding'] # (T, n_embd)
+    x,_ = jax.lax.scan(scan_fn, x, params['layers']) 
+    x = layer_norm(x, params['ln_f_gamma'], params['ln_f_beta']) # (B, T, n_embd)
+    x = x.astype(param_dtype) @ params['token_embedding'].T.astype(param_dtype) # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
 
-    return x.astype(jnp.float32) # (B, T, vocab_size) 
+    return x.astype(param_dtype) # (B, T, vocab_size) 
 
 @partial(jax.jit, static_argnames=['max_new_tokens', 'temperature', 'top_k'])
 def generate(params, prompt_tokens, max_new_tokens=100, temperature=1.0, top_k=None, key=jax.random.PRNGKey(0)):
@@ -187,13 +226,19 @@ def loss_fn(params, idx, targets, key=None):
     B, T, C = logits.shape
     logits = logits.reshape(B*T, C)
     targets = targets.reshape(B*T)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), targets).mean()
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(param_dtype), targets).mean()
     return loss
 
 @jax.jit
 def accume_step(params, idx, targets, key=None):
-    loss, grad = jax.value_and_grad(loss_fn)(params, idx, targets, key=key)
-    return loss, grad
+    def scan_fn(carry, inputs):
+        x,y = inputs
+        loss, grad = jax.value_and_grad(loss_fn)(params, x, y, key=key)
+        return carry, (loss, grad)
+    _, (loss, grad) = jax.lax.scan(scan_fn, None, (idx, targets))
+    avg_loss = loss.mean()
+    avg_grad = jax.tree.map(lambda g: g.mean(axis=0), grad)
+    return avg_loss, avg_grad
 
 def eval_model(params, key):
     xb, yb = get_eval_batch(val_data, key)
@@ -230,22 +275,19 @@ with mesh:
         accume_grad = None
         total_loss = 0.0
         t0 = time.time()
-        for micro_step in range(grad_accum_steps):
-            train_key, subkey = jax.random.split(train_key)
-            xb, yb = get_batch(current_chunck, subkey)
-            xb, yb = jax.device_put((xb, yb), NamedSharding(mesh, P('data', None)))
-            loss, grad = accume_step(params, xb, yb,key=subkey)
-            total_loss += loss
-            if accume_grad is None:
-                accume_grad = grad
-            else:
-                accume_grad = jax.tree.map(lambda g1, g2: g1 + g2, accume_grad, grad)
-        avg_loss = float(total_loss) / grad_accum_steps
-        accume_grad = jax.tree.map(lambda g: g / grad_accum_steps, accume_grad)
+
+        train_key, subkey = jax.random.split(train_key)
+        xb, yb = get_batch(current_chunck, subkey)
+        xb = xb.reshape(grad_accum_steps, -1, block_size) # (grad_accum_steps, batch_size, block_size)
+        yb = yb.reshape(grad_accum_steps, -1, block_size)
+        xb, yb = jax.device_put((xb, yb), NamedSharding(mesh, P('data', None)))
+        avg_loss,accume_grad = accume_step(params, xb, yb,key=subkey)
+
         norm = optax.global_norm(accume_grad)
         updates, opt_state = optimizer.update(accume_grad, opt_state, params)
         params = optax.apply_updates(params, updates)
-        loss.block_until_ready()  # Ensure loss is computed before timing
+
+        avg_loss.block_until_ready()  # Ensure loss is computed before timing
         t1 = time.time()
         dt = (t1 - t0) * 1000
         tokens_per_sec = (batch_size * block_size * grad_accum_steps) / (t1 - t0)
@@ -258,7 +300,7 @@ with mesh:
         if step % eval_interval == 0:
             key, eval_key = jax.random.split(key)
             val_loss = eval_model(params, eval_key)
-            print(f"Step {step}: train loss {total_loss / grad_accum_steps}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+            print(f"Step {step}: train loss {avg_loss}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 
 # write params to disk
