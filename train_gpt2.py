@@ -6,10 +6,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import wandb
 import pickle
-import numpy as np
 import time
-import pickle
-import numpy as np
 
 # --- Hyperparameters ---
 total_batch_size = 524288
@@ -35,45 +32,57 @@ key, subkey = jax.random.split(rng)
 
 
 data_buffer_train = jnp.zeros((100_000_000,), dtype=jnp.int32)
+
+def _read_bin_tokens(path: str):
+    with open(path, "rb") as f:
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
+        assert header[0] == 20240520, f"magic number mismatch: {path}"
+        assert header[1] == 1, f"unsupported shard version in: {path}"
+        ntok = int(header[2])
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, f"token count mismatch in {path}: header={ntok}, read={len(tokens)}"
+    return tokens.astype(np.int32), ntok
+
 def load_chunk(chunk_idx, data_buffer=data_buffer_train):
-    with open(f"fineweb10B/fineweb_train_{chunk_idx:06d}.bin", "rb") as f:
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32) 
-        assert header[0] == 20240520, "magic number"
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    tokens = jnp.array(tokens.astype(np.int32))
-    return data_buffer.at[:len(tokens)].set(tokens)
+    path = f"fineweb10B/fineweb_train_{chunk_idx:06d}.bin"
+    tokens, ntok = _read_bin_tokens(path)
+    tokens_jax = jnp.array(tokens, dtype=jnp.int32)
+    # write only valid prefix; sampling will be limited by ntok
+    data_buffer = data_buffer.at[:ntok].set(tokens_jax)
+    return data_buffer, ntok
+
 def load_val_chunk():
-    with open(f"fineweb10B/fineweb_val_000000.bin", "rb") as f:
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32) 
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    return jnp.array(tokens.astype(np.int32))
-val_data = load_val_chunk()
+    path = "fineweb10B/fineweb_val_000000.bin"
+    tokens, ntok = _read_bin_tokens(path)
+    return jnp.array(tokens, dtype=jnp.int32), ntok
+
+val_data, val_n_tokens = load_val_chunk()
 
 @jax.jit
-def get_batch(data_arr, key):
-    
-    # Generate random starting indices
-    ix = jax.random.randint(key, (batch_size * grad_accum_steps,), 0, len(data_arr) - block_size - 1)
-    
-    # Function to grab one slice, given one start index
+def get_batch(data_arr, n_tokens, key):
+    max_start = jnp.maximum(n_tokens - block_size - 1, 1)
+    ix = jax.random.randint(key, (batch_size * grad_accum_steps,), 0, max_start)
+
     def get_slice(start_i):
         x = jax.lax.dynamic_slice(data_arr, (start_i,), (block_size,))
         y = jax.lax.dynamic_slice(data_arr, (start_i + 1,), (block_size,))
         return x, y
-        
-    # Vectorize this over the batch of indices
+
     x, y = jax.vmap(get_slice)(ix)
     return x, y
+
 @jax.jit
-def get_eval_batch(data_arr, key):
-    ix = jax.random.randint(key, (eval_batch_size * grad_accum_steps,), 0, len(data_arr) - block_size - 1)
+def get_eval_batch(data_arr, n_tokens, key):
+    max_start = jnp.maximum(n_tokens - block_size - 1, 1)
+    ix = jax.random.randint(key, (eval_batch_size * grad_accum_steps,), 0, max_start)
+
     def get_slice(start_i):
         x = jax.lax.dynamic_slice(data_arr, (start_i,), (block_size,))
         y = jax.lax.dynamic_slice(data_arr, (start_i + 1,), (block_size,))
         return x, y
+
     x, y = jax.vmap(get_slice)(ix)
     return x, y
-
 def init_model_params(key, vocab_size, n_embd):
     head_size = n_embd // num_heads
     keys = jax.random.split(key, num=6 * n_layer + 2)
@@ -274,11 +283,11 @@ def train_step(params, muon_buffers, embed_state, lm_state, xb, yb, step, key):
     }
 
     return new_params, new_buffers, new_embed_state, new_lm_state, avg_loss
+
 def eval_model(params, key):
-    xb, yb = get_eval_batch(val_data, key)
+    xb, yb = get_eval_batch(val_data, val_n_tokens, key)
     val_loss = loss_fn(params, xb, yb, key=key)
     return val_loss
-
 
 # --- Training Loop ---
 params = init_model_params(subkey, vocab_size, n_embd)
@@ -341,11 +350,11 @@ with mesh:
     for step in range(max_iters):
         if step % steps_per_chunk == 0:
             chunk_idx = (step // steps_per_chunk) % num_chunks + 1
-            current_chunck = load_chunk(chunk_idx)
+            current_chunk, current_chunk_n_tokens = load_chunk(chunk_idx)
         t0 = time.time()
 
         train_key, subkey = jax.random.split(train_key)
-        xb, yb = get_batch(current_chunck, subkey)
+        xb, yb = get_batch(current_chunk, current_chunk_n_tokens, subkey)
         xb = xb.reshape(grad_accum_steps, -1, block_size)
         yb = yb.reshape(grad_accum_steps, -1, block_size)
         xb, yb = jax.device_put((xb, yb), NamedSharding(mesh, P(None,'data', None)))
