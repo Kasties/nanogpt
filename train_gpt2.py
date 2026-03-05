@@ -106,11 +106,14 @@ def init_model_params(key, vocab_size, n_embd):
             'W_ffwd':         p(jax.vmap(lambda k: jax.random.normal(k, (n_embd, 4 * n_embd)) * 0.02)(take(n_layer))),
             'W_out': jnp.zeros((n_layer,num_heads*head_size,n_embd), dtype=param_dtype),
             'W_ffwd_project': jnp.zeros((n_layer,4*n_embd,n_embd), dtype=param_dtype),
+            'lamb' : jnp.full((n_layer,), 0.5, dtype=param_dtype)
             },
     }       
     return params
 
-def newton_schulz(X, steps=5, eps=1e-7):
+def newton_schulz(X, steps=10, eps=1e-7):
+    if X.ndim < 2:
+        return X
     X = X.astype(compute_dtype)
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = X / (jnp.linalg.norm(X) + eps)
@@ -149,8 +152,8 @@ def rotary(x):
 @jax.jit
 def forward(params, idx):
     def scan_fn(x, layer_params):
-        x = transformer_block(x,layer_params)
-        return x, None
+        x,_  = transformer_block(x,layer_params, v1)
+        return x , None
 
     def apply_rotary_emb(x,cos, sin):
         d = x.shape[3]//2
@@ -174,29 +177,38 @@ def forward(params, idx):
         out = out @ layer_params['W_ffwd_project'] # (B, T, 4*n_embd) @ (4*n_embd, n_embd) -> (B, T, n_embd)
         return out
 
-    def multi_head_attention(x, layer_params):
-            # (B, T, n_embd) -> (B, T, num_heads * head_size)
-            q = jnp.einsum('bte,hes->bths', x, layer_params['W_q'].astype(compute_dtype)) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            k = jnp.einsum('bte,hes->bths', x, layer_params['W_k'].astype(compute_dtype)) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            v = jnp.einsum('bte,hes->bths', x, layer_params['W_v'].astype(compute_dtype)) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            
-            # do rotary embeddings
-            cos, sin = rotary(q)
-            q, k = rms_norm(q), rms_norm(k) # normalize before applying rotary
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-            out = jax.nn.dot_product_attention(q, k, v,is_causal=True)
-            out = out.astype(compute_dtype).reshape(B, T, -1) # (B, T, head_size)
-            out = out @ layer_params['W_out']# (B, T, num_heads * head_size) @ (num_heads * head_size, n_embd) -> (B, T, n_embd)
-            return out
-    def transformer_block(x, layer_params):
-        x = x + multi_head_attention(rms_norm(x), layer_params) # (B,T,n_embd)
-        x = x + feedforward(rms_norm(x), layer_params) # (B,T,n_embd)
-        return x.astype(compute_dtype)
+    def multi_head_attention(x, layer_params, v1=None):
+        q = jnp.einsum('bte,hes->bths', x, layer_params['W_q'].astype(compute_dtype))
+        k = jnp.einsum('bte,hes->bths', x, layer_params['W_k'].astype(compute_dtype))
+        v = jnp.einsum('bte,hes->bths', x, layer_params['W_v'].astype(compute_dtype))
+
+        # value residual mixing (no-op when v1 is None, i.e. first layer)
+        if v1 is not None:
+            lamb = layer_params['lamb'].astype(compute_dtype)
+            v = (1 - lamb) * v + lamb * v1
+
+        cos, sin = rotary(q)
+        q, k = rms_norm(q), rms_norm(k)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+        out = out.astype(compute_dtype).reshape(B, T, -1)
+        out = out @ layer_params['W_out']
+        return out, v
+
+    def transformer_block(x, layer_params, v1=None):
+        out, v = multi_head_attention(rms_norm(x), layer_params, v1)
+        x = x + out
+        x = x + feedforward(rms_norm(x), layer_params)
+        return x.astype(compute_dtype), v
     B,T = idx.shape
 
+
     x = params['token_embedding'][idx] # (B, T, n_embd)
+
     x = rms_norm(x) # (B, T, n_embd)
-    x,_ = jax.lax.scan(scan_fn, x, params['layers']) 
+    x, v1 = transformer_block(x, jax.tree.map(lambda p: p[0], params['layers']), v1=None)
+
+    x, _ = jax.lax.scan(scan_fn,x, jax.tree.map(lambda p: p[1:], params['layers'])) # scan over layers
     x = rms_norm(x) # (B, T, n_embd)
     x = x.astype(param_dtype) @ params['lm_head'] # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
     x = 30 * jnp.tanh(x / 30)
@@ -204,24 +216,13 @@ def forward(params, idx):
 
 
 @jax.jit
-def loss_fn(params, idx, targets, key=None):
+def loss_fn(params, idx, targets,key=None):
     logits = forward(params, idx) # (B, T, vocab_size)
     B, T, C = logits.shape
     logits = logits.reshape(B*T, C)
     targets = targets.reshape(B*T)
     loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(param_dtype), targets).mean()
     return loss
-
-@jax.jit
-def accume_step(params, idx, targets, key=None):
-    def scan_fn(carry, inputs):
-        x,y = inputs
-        loss, grad = jax.value_and_grad(loss_fn)(params, x, y, key=key)
-        return carry, (loss, grad)
-    _, (loss, grad) = jax.lax.scan(scan_fn, None, (idx, targets))
-    avg_loss = loss.mean()
-    avg_grad = jax.tree.map(lambda g: g.mean(axis=0), grad)
-    return avg_loss, avg_grad
 
 def muon_apply(grad_layers, muon_buffers, step):
     frac = jnp.minimum(step / 500.0, 1.0)
@@ -234,10 +235,18 @@ def muon_apply(grad_layers, muon_buffers, step):
         # orthogonalize — pick vmap depth based on shape
         if g.ndim == 4:  # (n_layer, num_heads, n_embd, head_size)
             ortho = jax.vmap(jax.vmap(newton_schulz))(direction)
-        else:  # (n_layer, dim1, dim2)
+            scale = jnp.sqrt(jnp.maximum(1.0, g.shape[-3] / g.shape[-1]))
+            return -lr * ortho * scale, new_buf
+        elif g.ndim == 3:  # (n_layer, dim1, dim2)
             ortho = jax.vmap(newton_schulz)(direction)
-        scale = jnp.sqrt(jnp.maximum(1.0, g.shape[-2] / g.shape[-1]))
-        return -lr * ortho * scale, new_buf
+            scale = jnp.sqrt(jnp.maximum(1.0, g.shape[-2] / g.shape[-1]))
+            return -lr * ortho * scale, new_buf
+        elif g.ndim == 2:  # (dim1, dim2)
+            ortho = newton_schulz(direction)
+            scale = jnp.sqrt(jnp.maximum(1.0, g.shape[-2] / g.shape[-1]))
+            return -lr * ortho * scale, new_buf
+        else:
+            return -lr * direction, new_buf
 
     updates = {}
     new_buffers = {}
@@ -255,7 +264,6 @@ def train_step(params, muon_buffers, embed_state, lm_state, xb, yb, step, key):
         new_loss = accloss + loss
         new_grad = jax.tree.map(lambda a, b: a + b, accgrad, grad)
         return (new_loss, new_grad), None
-
     (losses, grads), _  = jax.lax.scan(scan_fn, (0.0, jax.tree.map(jnp.zeros_like, params)), (xb, yb))
     avg_loss = losses/grad_accum_steps
     avg_grad = jax.tree.map(lambda g: g / grad_accum_steps, grads)
