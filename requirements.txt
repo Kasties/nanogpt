@@ -2,6 +2,6 @@
 jax[tpu]
 optax
 numpy
-tiktoken
 huggingface_hub
 wandb
+tpu-info

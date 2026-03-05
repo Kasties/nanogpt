@@ -13,3 +13,9 @@ wheels/
 fineweb10B/
 wandb/
 ./wandb/
+
+.gpt2_params.pkl
+./gpt2_params.pkl
+gpt2_params.pkl
+wandb/
+wandb/debug.log

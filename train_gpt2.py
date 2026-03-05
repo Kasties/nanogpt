@@ -7,11 +7,9 @@ import numpy as np
 import wandb
 import pickle
 import numpy as np
-import tiktoken
 import time
 import pickle
 import numpy as np
-
 
 # --- Hyperparameters ---
 total_batch_size = 524288
@@ -19,7 +17,7 @@ batch_size = 64
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size*block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
-max_iters = 3000
+max_iters = 6000
 device = 'tpu' 
 vocab_size = 50304 
 eval_interval = 300
@@ -28,8 +26,7 @@ n_layer = 12
 num_heads = 6
 param_dtype = jnp.float32
 compute_dtype = jnp.bfloat16
-max_lr = 6e-4
-warmdown_steps = 900
+warmdown_steps = 1200
 eval_batch_size = 16
 wandb.init(project="nanogpt-jax")
 
@@ -37,16 +34,26 @@ rng = jax.random.PRNGKey(1337)
 key, subkey = jax.random.split(rng)
 
 
-enc = tiktoken.get_encoding("gpt2")
-def load_chunk(chunk_idx):
-    tokens = np.fromfile(f"fineweb10B/fineweb_train_{chunk_idx:06d}.bin", dtype=np.uint16)
+data_buffer_train = jnp.zeros((100_000_000,), dtype=jnp.int32)
+def load_chunk(chunk_idx, data_buffer=data_buffer_train):
+    with open(f"fineweb10B/fineweb_train_{chunk_idx:06d}.bin", "rb") as f:
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32) 
+        assert header[0] == 20240520, "magic number"
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    tokens = jnp.array(tokens.astype(np.int32))
+    return data_buffer.at[:len(tokens)].set(tokens)
+def load_val_chunk():
+    with open(f"fineweb10B/fineweb_val_000000.bin", "rb") as f:
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32) 
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
     return jnp.array(tokens.astype(np.int32))
-val_data = jnp.array(np.fromfile("fineweb10B/fineweb_val_000000.bin", dtype=np.uint16).astype(np.int32))
+val_data = load_val_chunk()
+
 @jax.jit
 def get_batch(data_arr, key):
     
     # Generate random starting indices
-    ix = jax.random.randint(key, (batch_size,), 0, len(data_arr) - block_size - 1)
+    ix = jax.random.randint(key, (batch_size * grad_accum_steps,), 0, len(data_arr) - block_size - 1)
     
     # Function to grab one slice, given one start index
     def get_slice(start_i):
@@ -59,7 +66,7 @@ def get_batch(data_arr, key):
     return x, y
 @jax.jit
 def get_eval_batch(data_arr, key):
-    ix = jax.random.randint(key, (eval_batch_size,), 0, len(data_arr) - block_size - 1)
+    ix = jax.random.randint(key, (eval_batch_size * grad_accum_steps,), 0, len(data_arr) - block_size - 1)
     def get_slice(start_i):
         x = jax.lax.dynamic_slice(data_arr, (start_i,), (block_size,))
         y = jax.lax.dynamic_slice(data_arr, (start_i + 1,), (block_size,))
@@ -82,6 +89,7 @@ def init_model_params(key, vocab_size, n_embd):
         return keys[s] if n > 1 else keys[s][0]
     params = {
         'token_embedding':      p(jax.random.normal(take(), (vocab_size, n_embd)) * 0.02),
+        'lm_head':            jnp.zeros((n_embd, vocab_size), dtype=param_dtype),
         'layers': {
             'W_q':            p(jax.vmap(lambda k: jax.random.normal(k, (num_heads, n_embd, head_size)) * 0.02)(take(n_layer))),
             'W_k':            p(jax.vmap(lambda k: jax.random.normal(k, (num_heads, n_embd, head_size)) * 0.02)(take(n_layer))),
@@ -92,6 +100,30 @@ def init_model_params(key, vocab_size, n_embd):
             },
     }       
     return params
+
+def newton_schulz(X, steps=5, eps=1e-7):
+    X = X.astype(compute_dtype)
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = X / (jnp.linalg.norm(X) + eps)
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.T
+    def body(_, X):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        return a * X + B @ X
+    X = jax.lax.fori_loop(0, steps, body, X)
+    if transposed:
+        X = X.T
+    return X
+
+def muon_update(grad, momentum_buf, momentum=0.95):
+    buf = momentum * momentum_buf + grad
+    g = grad + momentum * buf  # nesterov
+    g = jax.vmap(newton_schulz)(g)  # vmap over layer dim
+    g = g * jnp.sqrt(jnp.maximum(1.0, g.shape[-2] / g.shape[-1]))
+    return g, buf
+
 
 def rotary(x):
     head_dim = x.shape[-1]
@@ -118,7 +150,7 @@ def forward(params, idx):
         cos = cos[:, None, :]
         y1 = x1 * cos + x2 * sin
         y2 = x1 * -sin + x2 * cos
-        return jnp.concatenate([y1, y2], axis=-1)
+        return jnp.concatenate([y1.astype(compute_dtype), y2.astype(compute_dtype)], axis=-1)
 
     def rms_norm(x, eps=1e-5):
         x_32 = x.astype(param_dtype)
@@ -129,15 +161,15 @@ def forward(params, idx):
 
     def feedforward(x, layer_params):
         out = x @ layer_params['W_ffwd']# (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd)
-        out = jnp.square(jax.nn.relu(out.astype(param_dtype))).astype(compute_dtype) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use relu squared
+        out = jnp.square(jax.nn.relu(out.astype(compute_dtype))) # (B, T, n_embd) @ (n_embd, 4*n_embd) -> (B, T, 4*n _embd) use relu squared
         out = out @ layer_params['W_ffwd_project'] # (B, T, 4*n_embd) @ (4*n_embd, n_embd) -> (B, T, n_embd)
         return out
 
     def multi_head_attention(x, layer_params):
             # (B, T, n_embd) -> (B, T, num_heads * head_size)
-            q = jnp.einsum('bte,hes->bths', x, layer_params['W_q']) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            k = jnp.einsum('bte,hes->bths', x, layer_params['W_k']) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
-            v = jnp.einsum('bte,hes->bths', x, layer_params['W_v']) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            q = jnp.einsum('bte,hes->bths', x, layer_params['W_q'].astype(compute_dtype)) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            k = jnp.einsum('bte,hes->bths', x, layer_params['W_k'].astype(compute_dtype)) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
+            v = jnp.einsum('bte,hes->bths', x, layer_params['W_v'].astype(compute_dtype)) # (B, T, n_embd) @ (n_embd, head_size) -> (B, T, head_size)
             
             # do rotary embeddings
             cos, sin = rotary(q)
@@ -157,38 +189,10 @@ def forward(params, idx):
     x = rms_norm(x) # (B, T, n_embd)
     x,_ = jax.lax.scan(scan_fn, x, params['layers']) 
     x = rms_norm(x) # (B, T, n_embd)
-    x = x.astype(param_dtype) @ params['token_embedding'].T.astype(param_dtype) # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
-    x = 30 * jnp.tanh(x / 30) # clip logits to prevent overflow
-
+    x = x.astype(param_dtype) @ params['lm_head'] # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
+    x = 30 * jnp.tanh(x / 30)
     return x.astype(param_dtype) # (B, T, vocab_size) 
 
-@partial(jax.jit, static_argnames=['max_new_tokens', 'temperature', 'top_k'])
-def generate(params, prompt_tokens, max_new_tokens=100, temperature=1.0, top_k=None, key=jax.random.PRNGKey(0)):
-    """
-    prompt_tokens: list or 1D array of token ids
-    """
-    # Start with shape (1, T)
-    idx = jnp.array(prompt_tokens, dtype=jnp.int32)[None, :]
-
-    for _ in range(max_new_tokens):
-        # Crop to block_size if too long
-        idx_cond = idx[:, -block_size:]
-        logits = forward(params, idx_cond)  # (1, T, vocab_size)
-        logits = logits[:, -1, :]  # (1, vocab_size)
-        logits = logits / temperature
-        # Optional top-k sampling
-        if top_k is not None:
-            top_k_logits, top_k_indices = jax.lax.top_k(logits, top_k)
-            # Set everything outside top-k to -inf
-            logits = jnp.full_like(logits, -jnp.inf)
-            logits = logits.at[0, top_k_indices[0]].set(top_k_logits[0])
-        key, subkey = jax.random.split(key)
-        next_token = jax.random.categorical(subkey, logits, axis=-1)  # (1,)
-
-        # Append to sequence
-        idx = jnp.concatenate([idx, next_token[:, None]], axis=1)
-
-    return idx[0]  # return 1D array of tokens
 
 @jax.jit
 def loss_fn(params, idx, targets, key=None):
@@ -210,6 +214,66 @@ def accume_step(params, idx, targets, key=None):
     avg_grad = jax.tree.map(lambda g: g.mean(axis=0), grad)
     return avg_loss, avg_grad
 
+def muon_apply(grad_layers, muon_buffers, step):
+    frac = jnp.minimum(step / 500.0, 1.0)
+    momentum = (1 - frac) * 0.85 + frac * 0.95
+    lr = muon_lr_schedule(step)
+
+    def update_one(g, buf):
+        new_buf = momentum * buf + g
+        direction = g + momentum * new_buf
+        # orthogonalize — pick vmap depth based on shape
+        if g.ndim == 4:  # (n_layer, num_heads, n_embd, head_size)
+            ortho = jax.vmap(jax.vmap(newton_schulz))(direction)
+        else:  # (n_layer, dim1, dim2)
+            ortho = jax.vmap(newton_schulz)(direction)
+        scale = jnp.sqrt(jnp.maximum(1.0, g.shape[-2] / g.shape[-1]))
+        return -lr * ortho * scale, new_buf
+
+    updates = {}
+    new_buffers = {}
+    for k in grad_layers:
+        updates[k], new_buffers[k] = update_one(grad_layers[k], muon_buffers[k])
+
+    return updates, new_buffers
+
+@jax.jit
+def train_step(params, muon_buffers, embed_state, lm_state, xb, yb, step, key):
+    def scan_fn(carry, inputs):
+        accloss, accgrad = carry
+        x, y = inputs
+        loss, grad = jax.value_and_grad(loss_fn)(params, x, y, key=key)
+        new_loss = accloss + loss
+        new_grad = jax.tree.map(lambda a, b: a + b, accgrad, grad)
+        return (new_loss, new_grad), None
+
+    (losses, grads), _  = jax.lax.scan(scan_fn, (0.0, jax.tree.map(jnp.zeros_like, params)), (xb, yb))
+    avg_loss = losses/grad_accum_steps
+    avg_grad = jax.tree.map(lambda g: g / grad_accum_steps, grads)
+
+    # Muon for layer weights
+    layer_updates, new_buffers = muon_apply(avg_grad['layers'], muon_buffers, step)
+    new_layers = jax.tree.map(lambda p, u: p + u, params['layers'], layer_updates)
+
+    # Adam for embedding (lr=0.6)
+    embed_updates, new_embed_state = embed_opt.update(
+        avg_grad['token_embedding'], embed_state, params['token_embedding']
+    )
+    new_embed = optax.apply_updates(params['token_embedding'], embed_updates)
+
+    # Adam for lm_head (lr=0.008)
+    lm_updates, new_lm_state = lm_opt.update(
+        avg_grad['lm_head'], lm_state, params['lm_head']
+    )
+    new_lm = optax.apply_updates(params['lm_head'], lm_updates)
+
+    new_params = {
+        'token_embedding': new_embed,
+        'lm_head': new_lm,
+        'layers': new_layers,
+    }
+
+    return new_params, new_buffers, new_embed_state, new_lm_state, avg_loss
 def eval_model(params, key):
     xb, yb = get_eval_batch(val_data, key)
     val_loss = loss_fn(params, xb, yb, key=key)
@@ -223,28 +287,44 @@ print(f"Training on {device}...")
 key, train_key = jax.random.split(key)
 
 
-scheduler = optax.join_schedules(
-        schedules=[
-            optax.constant_schedule(max_lr),
-            optax.linear_schedule(max_lr, 0.0, warmdown_steps)
-        ],
-        boundaries=[
-            max_iters - warmdown_steps
-        ]
-    )
-optimizer = optax.chain(
-    optax.clip_by_global_norm(1.0),
-    optax.adamw(
-        learning_rate=scheduler, 
-        b1=0.9, 
-        b2=0.95, 
-        eps=1e-8, 
-        weight_decay=0.1, 
-        mask=lambda p: jax.tree.map(lambda x: x.ndim >= 2, p) # Only decay matrices
-    )
+
+# --- Init momentum buffers for Muon params ---
+muon_buffers = jax.tree.map(jnp.zeros_like, params['layers'])
+
+# --- Adam only handles embeddings/lm_head ---
+adam_params = {
+    'token_embedding': params['token_embedding'],
+    'lm_head': params['lm_head'],
+}
+
+scheduler_embed = optax.join_schedules(
+    schedules=[
+        optax.constant_schedule(0.6),
+        optax.linear_schedule(0.6, 0.0, warmdown_steps)
+    ],
+    boundaries=[max_iters - warmdown_steps]
 )
-optimizer = optax.apply_if_finite(optimizer,max_consecutive_errors=5)
-opt_state = optimizer.init(params)
+
+embed_opt = optax.adam(learning_rate=scheduler_embed, b1=0.9, b2=0.95)
+embed_adam_state = embed_opt.init(params['token_embedding'])
+scheduler_lm = optax.join_schedules(
+    schedules=[
+        optax.constant_schedule(0.008),
+        optax.linear_schedule(0.008, 0.0, warmdown_steps)
+    ],
+    boundaries=[max_iters - warmdown_steps]
+)
+lm_opt = optax.adam(learning_rate=scheduler_lm, b1=0.9, b2=0.95)
+lm_adam_state = lm_opt.init(params['lm_head'])
+# --- Muon LR schedule (same shape: constant then warmdown) ---
+muon_lr_schedule = optax.join_schedules(
+    schedules=[
+        optax.constant_schedule(0.04),
+        optax.linear_schedule(0.04, 0.0, warmdown_steps)
+    ],
+    boundaries=[max_iters - warmdown_steps]
+)
+
 
 devices = jax.devices()
 print(f"Available devices: {devices}")
@@ -255,42 +335,40 @@ num_chunks = 103  # full fineweb10B. Each chunk is 100M tokens
 steps_per_chunk = (100_000_000) // (batch_size * block_size * grad_accum_steps)
 with mesh:
     params = jax.device_put(params, NamedSharding(mesh, P()))
-    opt_state = jax.device_put(opt_state, NamedSharding(mesh, P()))
+    muon_buffers = jax.device_put(muon_buffers, NamedSharding(mesh, P()))
+    embed_adam_state = jax.device_put(embed_adam_state, NamedSharding(mesh, P()))
+    lm_adam_state = jax.device_put(lm_adam_state, NamedSharding(mesh, P()))
     for step in range(max_iters):
         if step % steps_per_chunk == 0:
             chunk_idx = (step // steps_per_chunk) % num_chunks + 1
             current_chunck = load_chunk(chunk_idx)
-        accume_grad = None
-        total_loss = 0.0
         t0 = time.time()
 
         train_key, subkey = jax.random.split(train_key)
         xb, yb = get_batch(current_chunck, subkey)
-        xb = xb.reshape(grad_accum_steps, -1, block_size) # (grad_accum_steps, batch_size, block_size)
+        xb = xb.reshape(grad_accum_steps, -1, block_size)
         yb = yb.reshape(grad_accum_steps, -1, block_size)
-        xb, yb = jax.device_put((xb, yb), NamedSharding(mesh, P('data', None)))
-        avg_loss,accume_grad = accume_step(params, xb, yb,key=subkey)
+        xb, yb = jax.device_put((xb, yb), NamedSharding(mesh, P(None,'data', None)))
 
-        norm = optax.global_norm(accume_grad)
-        updates, opt_state = optimizer.update(accume_grad, opt_state, params)
-        params = optax.apply_updates(params, updates)
+        params, muon_buffers, embed_adam_state, lm_adam_state, avg_loss = train_step(
+            params, muon_buffers, embed_adam_state, lm_adam_state, xb, yb, jnp.array(step), subkey
+        )
 
-        avg_loss.block_until_ready()  # Ensure loss is computed before timing
+        avg_loss.block_until_ready()
         t1 = time.time()
         dt = (t1 - t0) * 1000
         tokens_per_sec = (batch_size * block_size * grad_accum_steps) / (t1 - t0)
         wandb.log({
                 "train/loss": avg_loss,
-                "train/grad_norm": float(norm),
                 "train/tokens_per_sec": tokens_per_sec,
-                "train/lr": float(scheduler(step)),
+                "train/lr_embed": float(scheduler_embed(step)),
+                "train/lr_lm": float(scheduler_lm(step)),
+                "train/lr_muon": float(muon_lr_schedule(step)),
             }, step=step)
         if step % eval_interval == 0:
             key, eval_key = jax.random.split(key)
             val_loss = eval_model(params, eval_key)
             print(f"Step {step}: train loss {avg_loss}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
-
-
 # write params to disk
 
 print("Saving model parameters...")
