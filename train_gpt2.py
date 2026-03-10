@@ -7,7 +7,7 @@ import numpy as np
 import wandb
 import pickle
 import time
-
+from jax.ad_checkpoint import checkpoint as remat
 # --- TPU Detection and Hardware-Aware Config ---
 def get_tpu_type():
     """Detect TPU version from device kind string."""
@@ -50,12 +50,12 @@ batch_size = 64
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size*block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
-max_iters = 6000
+max_iters = 4000
 device = 'tpu' 
 vocab_size = 50304 
-eval_interval = 150
+eval_interval = 100
 n_layer = 12
-param_dtype = jnp.float32
+param_dtype = jnp.bfloat16
 compute_dtype = jnp.bfloat16
 warmdown_steps = int(max_iters * 0.4)
 eval_batch_size = 16
@@ -186,7 +186,7 @@ def rotary(x):
 @jax.jit
 def forward(params, idx):
     def scan_fn(x, layer_params):
-        x,_  = transformer_block(x,layer_params, v1)
+        x,_  = remat(transformer_block)(x,layer_params, v1)
         return x , None
 
     def apply_rotary_emb(x,cos, sin):
@@ -244,19 +244,33 @@ def forward(params, idx):
 
     x, _ = jax.lax.scan(scan_fn,x, jax.tree.map(lambda p: p[1:], params['layers'])) # scan over layers
     x = rms_norm(x) # (B, T, n_embd)
-    x = x.astype(param_dtype) @ params['lm_head'] # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
-    x = 15 * jnp.tanh(x / 15)
-    return x.astype(param_dtype) # (B, T, vocab_size) 
+    # x = x.astype(param_dtype) @ params['lm_head'] # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
+    # x = 15 * jnp.tanh(x / 15)
+    return x # (B, T, vocab_size)
 
+
+def chunked_loss(logits_fn, targets, n_chunks=8):
+    """Compute cross-entropy without materializing full (B*T, vocab) tensor."""
+    B, T = targets.shape
+    targets = targets.reshape(-1)
+    chunk_size = (B * T) // n_chunks
+    total_loss = 0.0
+    for i in range(n_chunks):
+        s = i * chunk_size
+        logit_chunk = logits_fn(s, chunk_size)  # only compute this slice
+        loss_chunk = optax.softmax_cross_entropy_with_integer_labels(
+            logit_chunk.astype(param_dtype), targets[s:s+chunk_size]
+        ).sum()
+        total_loss += loss_chunk
+    return total_loss / (B * T)
 
 @jax.jit
-def loss_fn(params, idx, targets,key=None):
-    logits = forward(params, idx) # (B, T, vocab_size)
-    B, T, C = logits.shape
-    logits = logits.reshape(B*T, C)
-    targets = targets.reshape(B*T)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(param_dtype), targets).mean()
-    return loss
+def loss_fn(params, idx, targets, key=None):
+    hidden = forward(params, idx)  # (B, T, n_embd)
+    def logits_fn(start, size):
+        h_chunk = hidden.reshape(-1, n_embd)[start:start+size]
+        return h_chunk @ params['lm_head']  # (chunk, vocab)
+    return chunked_loss(logits_fn, targets, n_chunks=8)
 
 def muon_apply(grad_layers, muon_buffers, step):
     frac = jnp.minimum(step / 500.0, 1.0)
