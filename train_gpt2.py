@@ -8,9 +8,45 @@ import wandb
 import pickle
 import time
 
+# --- TPU Detection and Hardware-Aware Config ---
+def get_tpu_type():
+    """Detect TPU version from device kind string."""
+    devices = jax.devices()
+    if not devices or devices[0].platform != 'tpu':
+        return None
+    kind = devices[0].device_kind.lower()
+    if 'v6e' in kind or 'trillium' in kind or 'v6' in kind:
+        return 'v6e'
+    if 'v5e' in kind or 'v5litepod' in kind:
+        return 'v5e'
+    if 'v5p' in kind or 'v5' in kind:
+        return 'v5p'
+    if 'v4' in kind:
+        return 'v4'
+    if 'v3' in kind:
+        return 'v3'
+    if 'v2' in kind:
+        return 'v2'
+    return 'unknown'
+
+tpu_type = get_tpu_type()
+print(f"Detected TPU type: {tpu_type}")
+
+# MXU sizes:
+#   v6e/Trillium: 256x256 -> d_head=256, num_heads=4, n_embd=1024
+#   v2/v3/v4/v5e/v5p: 128x128 -> d_head=128, num_heads=6, n_embd=768
+if tpu_type in ('v6e',):
+    n_embd = 1024
+    num_heads = 4
+    print(f"Using v6e-optimized config: n_embd={n_embd}, num_heads={num_heads}, d_head={n_embd // num_heads}")
+else:
+    n_embd = 768
+    num_heads = 6
+    print(f"Using standard config: n_embd={n_embd}, num_heads={num_heads}, d_head={n_embd // num_heads}")
+
 # --- Hyperparameters ---
 total_batch_size = 524288
-batch_size = 128
+batch_size = 64
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size*block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
@@ -18,9 +54,7 @@ max_iters = 6000
 device = 'tpu' 
 vocab_size = 50304 
 eval_interval = 300
-n_embd = 1024
 n_layer = 12
-num_heads = 4
 param_dtype = jnp.float32
 compute_dtype = jnp.bfloat16
 warmdown_steps = 1200
@@ -301,6 +335,7 @@ def eval_model(params, key):
 params = init_model_params(subkey, vocab_size, n_embd)
 
 print(f"Training on {device}...")
+print(f"Config: n_embd={n_embd}, num_heads={num_heads}, d_head={n_embd // num_heads}, n_layer={n_layer}")
 key, train_key = jax.random.split(key)
 
 
@@ -375,17 +410,25 @@ with mesh:
         t1 = time.time()
         dt = (t1 - t0) * 1000
         tokens_per_sec = (batch_size * block_size * grad_accum_steps) / (t1 - t0)
-        wandb.log({
-                "train/loss": avg_loss,
-                "train/tokens_per_sec": tokens_per_sec,
-                "train/lr_embed": float(scheduler_embed(step)),
-                "train/lr_lm": float(scheduler_lm(step)),
-                "train/lr_muon": float(muon_lr_schedule(step)),
-            }, step=step)
+
+        log_dict = {
+            "train/loss": float(avg_loss),
+            "train/tokens_per_sec": tokens_per_sec,
+            "train/lr_embed": float(scheduler_embed(step)),
+            "train/lr_lm": float(scheduler_lm(step)),
+            "train/lr_muon": float(muon_lr_schedule(step)),
+            "train/step_time_ms": dt,
+        }
+
         if step % eval_interval == 0:
             key, eval_key = jax.random.split(key)
             val_loss = eval_model(params, eval_key)
-            print(f"Step {step}: train loss {avg_loss}, val loss {val_loss} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+            val_loss_float = float(val_loss)
+            log_dict["val/loss"] = val_loss_float
+            print(f"Step {step}: train loss {float(avg_loss):.4f}, val loss {val_loss_float:.4f} in {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+
+        wandb.log(log_dict, step=step)
+
 # write params to disk
 
 print("Saving model parameters...")
