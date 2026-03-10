@@ -10,7 +10,7 @@ import time
 
 # --- Hyperparameters ---
 total_batch_size = 524288
-batch_size = 64
+batch_size = 128
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size*block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
@@ -18,9 +18,9 @@ max_iters = 6000
 device = 'tpu' 
 vocab_size = 50304 
 eval_interval = 300
-n_embd = 768
+n_embd = 1024
 n_layer = 12
-num_heads = 6
+num_heads = 4
 param_dtype = jnp.float32
 compute_dtype = jnp.bfloat16
 warmdown_steps = 1200
@@ -111,7 +111,7 @@ def init_model_params(key, vocab_size, n_embd):
     }       
     return params
 
-def newton_schulz(X, steps=10, eps=1e-7):
+def newton_schulz(X, steps=5, eps=1e-7):
     if X.ndim < 2:
         return X
     X = X.astype(compute_dtype)
