@@ -53,11 +53,11 @@ print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch siz
 max_iters = 6000
 device = 'tpu' 
 vocab_size = 50304 
-eval_interval = 300
+eval_interval = 150
 n_layer = 12
 param_dtype = jnp.float32
 compute_dtype = jnp.bfloat16
-warmdown_steps = 1200
+warmdown_steps = int(max_iters * 0.4)
 eval_batch_size = 16
 wandb.init(project="nanogpt-jax")
 
@@ -173,7 +173,7 @@ def muon_update(grad, momentum_buf, momentum=0.95):
 
 def rotary(x):
     head_dim = x.shape[-1]
-    inv_freq = 1.0 / (10000 ** (jnp.arange(0, head_dim, 2) / head_dim))
+    inv_freq = 1.0 / (1024 ** (jnp.arange(0, head_dim, 2) / head_dim))
     seq_len = x.shape[1]
     t = jnp.arange(seq_len)
     freqs = jnp.einsum('i,j->ij', t, inv_freq)
@@ -245,7 +245,7 @@ def forward(params, idx):
     x, _ = jax.lax.scan(scan_fn,x, jax.tree.map(lambda p: p[1:], params['layers'])) # scan over layers
     x = rms_norm(x) # (B, T, n_embd)
     x = x.astype(param_dtype) @ params['lm_head'] # (B, T, n_embd) @ (n_embd, vocab_size) -> (B, T, vocab_size)
-    x = 30 * jnp.tanh(x / 30)
+    x = 15 * jnp.tanh(x / 15)
     return x.astype(param_dtype) # (B, T, vocab_size) 
 
 
@@ -357,7 +357,7 @@ scheduler_embed = optax.join_schedules(
     boundaries=[max_iters - warmdown_steps]
 )
 
-embed_opt = optax.adam(learning_rate=scheduler_embed, b1=0.9, b2=0.95)
+embed_opt = optax.adam(learning_rate=scheduler_embed, b1=0.9, b2=0.95, eps=1e-10)
 embed_adam_state = embed_opt.init(params['token_embedding'])
 scheduler_lm = optax.join_schedules(
     schedules=[
@@ -366,7 +366,7 @@ scheduler_lm = optax.join_schedules(
     ],
     boundaries=[max_iters - warmdown_steps]
 )
-lm_opt = optax.adam(learning_rate=scheduler_lm, b1=0.9, b2=0.95)
+lm_opt = optax.adam(learning_rate=scheduler_lm, b1=0.9, b2=0.95, eps=1e-10)
 lm_adam_state = lm_opt.init(params['lm_head'])
 # --- Muon LR schedule (same shape: constant then warmdown) ---
 muon_lr_schedule = optax.join_schedules(
