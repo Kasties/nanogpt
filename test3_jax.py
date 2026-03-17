@@ -10,7 +10,7 @@ import time
 
 # --- Hyperparameters ---
 total_batch_size = 524288
-batch_size = 512
+batch_size = 256
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size * block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
@@ -20,11 +20,15 @@ eval_interval = 128
 n_layer = 12
 param_dtype = jnp.float32
 compute_dtype = jnp.bfloat16
-
+# ============================================================
+# CHANGE 4: Warmdown = 40% of training (was fixed 2048 steps)
+#   - Matches the Muon recipe from Doc 4
+#   - No warmup needed with Muon (was 256 steps)
+# ============================================================
 warmdown_steps = int(max_iters * 0.4)
 eval_batch_size = 16
-n_embd = 1024
-num_heads = 4
+n_embd = 768
+num_heads = 12
 head_dim = n_embd // num_heads
 attn_scale = 1.0 / (2 * n_layer) ** 0.5
 
@@ -182,6 +186,15 @@ def forward(params, idx):
         q = q.reshape(B, T, num_heads, head_dim)
         k = k.reshape(B, T, num_heads, head_dim)
         v = v.reshape(B, T, num_heads, head_dim)
+
+        # ============================================================
+        # CHANGE 7: QK-norm — stabilizes attention with high Muon LRs
+        #   - Without this, Q/K magnitudes grow unchecked → attention
+        #     logits explode → training diverges after ~2k steps
+        #   - Was: no normalization before RoPE
+        # ============================================================
+        q = rms_norm(q)
+        k = rms_norm(k)
 
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
