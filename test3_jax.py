@@ -10,7 +10,7 @@ import time
 
 # --- Hyperparameters ---
 total_batch_size = 524288
-batch_size = 256
+batch_size = 512
 block_size = 1024
 grad_accum_steps = total_batch_size // (batch_size * block_size)
 print(f"Using grad_accum_steps={grad_accum_steps} to achieve effective batch size of {total_batch_size}")
@@ -27,8 +27,8 @@ compute_dtype = jnp.bfloat16
 # ============================================================
 warmdown_steps = int(max_iters * 0.4)
 eval_batch_size = 16
-n_embd = 768
-num_heads = 12
+n_embd = 1024
+num_heads = 4
 head_dim = n_embd // num_heads
 attn_scale = 1.0 / (2 * n_layer) ** 0.5
 
